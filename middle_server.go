@@ -18,7 +18,7 @@ type AuthRequest struct {
 // --- CONFIGURATION ---
 const (
 	BRAIN_ADDR = "18.184.135.220:8080" // <--- ONLY STATIC SETTING REQUIRED
-	RELAY_PORT = "5001"               // The port this VPS will listen on
+	RELAY_PORT = "5001"                // The port this VPS will listen on
 )
 
 // getPublicIP reaches out to external providers to find the VPS's true identity
@@ -99,11 +99,15 @@ func main() {
 }
 
 func bridge(c1, c2 net.Conn) {
+	// A tiny pause ensures the OS has fully established both sockets
+	// and cleared any lingering RST packets.
+	time.Sleep(100 * time.Millisecond)
+
 	errChan := make(chan error, 2)
 	go func() { _, err := io.Copy(c1, c2); errChan <- err }()
 	go func() { _, err := io.Copy(c2, c1); errChan <- err }()
+
 	<-errChan
 	c1.Close()
 	c2.Close()
-	fmt.Println("[-] Tunnel Closed.")
 }
