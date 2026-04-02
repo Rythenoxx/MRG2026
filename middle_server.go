@@ -17,7 +17,7 @@ type AuthRequest struct {
 
 // --- CONFIGURATION ---
 const (
-	BRAIN_ADDR = "YOUR_BRAIN_IP:8080" // <--- ONLY STATIC SETTING REQUIRED
+	BRAIN_ADDR = "18.184.135.220:8080" // <--- ONLY STATIC SETTING REQUIRED
 	RELAY_PORT = "5001"               // The port this VPS will listen on
 )
 
