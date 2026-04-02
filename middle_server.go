@@ -21,35 +21,6 @@ const (
 	RELAY_PORT = "5001"                // The port this VPS will listen on
 )
 
-func startDashboardAPI() {
-	// 1. Endpoint to get all Active Nodes
-	http.HandleFunc("/api/nodes", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*") // Allow Dashboard to talk to API
-
-		mu.Lock()
-		defer mu.Unlock()
-
-		// Return the activeTargets map as JSON
-		json.NewEncoder(w).Encode(activeTargets)
-	})
-
-	// 2. Endpoint to send a command from the Web
-	http.HandleFunc("/api/command", func(w http.ResponseWriter, r *http.Request) {
-		targetID := r.URL.Query().Get("id")
-		cmd := r.URL.Query().Get("cmd")
-
-		mu.Lock()
-		activeSessions[strings.ToUpper(targetID)] = cmd // Queue it for the next poll
-		mu.Unlock()
-
-		fmt.Fprintf(w, "Command %s queued for %s", cmd, targetID)
-	})
-
-	fmt.Println("[WEB] Dashboard API listening on :9000")
-	http.ListenAndServe(":9000", nil)
-}
-
 // getPublicIP reaches out to external providers to find the VPS's true identity
 func getPublicIP() string {
 	providers := []string{
@@ -97,8 +68,7 @@ func main() {
 			}
 		}
 	}()
-	// Start the API in the background
-	go startDashboardAPI()
+
 	// 3. THE BRIDGE ENGINE
 	fmt.Printf("==========================================\n")
 	fmt.Printf("   PLUG-AND-PLAY RELAY: %s:%s\n", myPublicIP, RELAY_PORT)
