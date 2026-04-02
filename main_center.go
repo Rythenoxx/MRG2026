@@ -28,6 +28,7 @@ var (
 	lastSeen       = make(map[string]time.Time)
 	mu             sync.Mutex
 )
+var relayCooldown = make(map[string]time.Time)
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
@@ -80,7 +81,13 @@ func handleConnection(conn net.Conn) {
 		activeSessions[id] = selectedRelay
 		json.NewEncoder(conn).Encode(RoutingInfo{RelayAddr: selectedRelay})
 		fmt.Printf("[>] Session Set: %s -> %s\n", id, selectedRelay)
-
+		for _, r := range relayPool {
+			if time.Since(relayCooldown[r]) > 2*time.Second {
+				selectedRelay = r
+				relayCooldown[r] = time.Now()
+				break
+			}
+		}
 	case "client_poll":
 		if addr, exists := activeSessions[id]; exists {
 			json.NewEncoder(conn).Encode(RoutingInfo{RelayAddr: addr})
