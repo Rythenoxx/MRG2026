@@ -20,6 +20,24 @@ const (
 	BRAIN_ADDR = "18.184.135.220:8080" // <--- ONLY STATIC SETTING REQUIRED
 	RELAY_PORT = "5001"                // The port this VPS will listen on
 )
+const PSK = "8fG2nL9xW4vPzQ7mR1bA6kS3hJ5dY9tE" // Must match in all components
+
+func handleHandshake(conn net.Conn) bool {
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, len(PSK))
+
+	_, err := io.ReadFull(conn, buf)
+	if err != nil || string(buf) != PSK {
+		fmt.Printf("[!] Handshake Failed from %s\n", conn.RemoteAddr())
+		conn.Write([]byte("ERROR: UNAUTHORIZED\n"))
+		conn.Close()
+		return false
+	}
+
+	// Handshake success - clear deadline for the bridge
+	conn.SetReadDeadline(time.Time{})
+	return true
+}
 
 // getPublicIP reaches out to external providers to find the VPS's true identity
 func getPublicIP() string {
@@ -46,58 +64,44 @@ func getPublicIP() string {
 }
 
 func main() {
-	// 1. AUTO-IDENTITY
 	myPublicIP := getPublicIP()
-	fmt.Printf("[+] BOOT: Detected Public IP: %s\n", myPublicIP)
 
-	// 2. BACKGROUND HEARTBEAT
+	// Heartbeat to Brain
 	go func() {
 		for {
 			conn, err := net.DialTimeout("tcp", BRAIN_ADDR, 5*time.Second)
 			if err == nil {
-				// Tell the Brain: "I am a fresh relay at this address"
 				json.NewEncoder(conn).Encode(AuthRequest{
 					Type:   "middle",
 					Listen: myPublicIP + ":" + RELAY_PORT,
 				})
 				conn.Close()
-				time.Sleep(30 * time.Second) // Check in every 30s
+				time.Sleep(30 * time.Second)
 			} else {
-				fmt.Printf("[!] Connection to Brain failed. Retrying in 10s...\n")
 				time.Sleep(10 * time.Second)
 			}
 		}
 	}()
 
-	// 3. THE BRIDGE ENGINE
-	fmt.Printf("==========================================\n")
-	fmt.Printf("   PLUG-AND-PLAY RELAY: %s:%s\n", myPublicIP, RELAY_PORT)
-	fmt.Printf("==========================================\n")
-
-	ln, err := net.Listen("tcp", ":"+RELAY_PORT)
-	if err != nil {
-		fmt.Printf("[!] FATAL ERROR: %v\n", err)
-		return
-	}
+	ln, _ := net.Listen("tcp", ":"+RELAY_PORT)
+	fmt.Printf("[+] Relay active on %s:%s (PSK Protected)\n", myPublicIP, RELAY_PORT)
 
 	for {
-		// Wait for Ghost or Operator (Order doesn't matter, first two matched)
-		c1, err := ln.Accept()
-		if err != nil {
+		c1, _ := ln.Accept()
+		if !handleHandshake(c1) {
 			continue
 		}
 
-		c2, err := ln.Accept()
-		if err != nil {
+		c2, _ := ln.Accept()
+		if !handleHandshake(c2) {
 			c1.Close()
 			continue
 		}
 
-		fmt.Printf("[+] Connection Tunneled: %s\n", time.Now().Format("15:04:05"))
+		fmt.Printf("[+] Secure Bridge Established: %s\n", time.Now().Format("15:04:05"))
 		go bridge(c1, c2)
 	}
 }
-
 func bridge(c1, c2 net.Conn) {
 	// A tiny pause ensures the OS has fully established both sockets
 	// and cleared any lingering RST packets.

