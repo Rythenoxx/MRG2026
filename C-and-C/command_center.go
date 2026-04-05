@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	crypto "mrg2026/Crypto"
 	"net"
 	"os"
 	"strings"
@@ -358,11 +359,11 @@ func executeRotatingCommand(id, cmd string) string {
 
 	// 4. Handle Encryption (Crucial Step)
 	// You MUST generate the same session key the ghost expects
-	sessionKey := generateSessionKey() // This function must be in your crypto.go
+	sessionKey := crypto.GenerateSessionKey() // This function must be in your crypto.go
 	conn.Write(sessionKey)
 
 	// 5. Send Encrypted Command
-	encCmd, _ := encryptPayload(cmd, sessionKey)
+	encCmd, _ := crypto.EncryptPayload(cmd, sessionKey)
 	fmt.Fprintf(conn, "%s\n", encCmd)
 
 	// 6. Read and Decrypt the Result
@@ -373,7 +374,7 @@ func executeRotatingCommand(id, cmd string) string {
 	}
 
 	// Decrypt the response before returning it to the TUI
-	decryptedRes, err := decryptPayload(strings.TrimSpace(reply), sessionKey)
+	decryptedRes, err := crypto.DecryptPayload(strings.TrimSpace(reply), sessionKey)
 	if err != nil {
 		return "[red]Decryption Error: " + err.Error() + "[-]"
 	}

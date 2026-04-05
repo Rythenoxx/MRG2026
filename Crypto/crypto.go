@@ -1,4 +1,4 @@
-package main
+package crypto
 
 import (
 	"crypto/aes"
@@ -9,7 +9,7 @@ import (
 )
 
 // Encrypts using a 32-byte session key
-func encryptPayload(plainText string, key []byte) (string, error) {
+func EncryptPayload(plainText string, key []byte) (string, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", err
@@ -27,7 +27,7 @@ func encryptPayload(plainText string, key []byte) (string, error) {
 }
 
 // Decrypts using a 32-byte session key
-func decryptPayload(cryptoText string, key []byte) (string, error) {
+func DecryptPayload(cryptoText string, key []byte) (string, error) {
 	data, err := base64.StdEncoding.DecodeString(cryptoText)
 	if err != nil {
 		return "", err
@@ -53,7 +53,7 @@ func decryptPayload(cryptoText string, key []byte) (string, error) {
 }
 
 // Generates a random 32-byte key for AES-256
-func generateSessionKey() []byte {
+func GenerateSessionKey() []byte {
 	key := make([]byte, 32)
 	rand.Read(key)
 	return key

