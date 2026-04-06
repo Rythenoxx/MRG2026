@@ -1,4 +1,4 @@
-module mrg2026
+module lo_shell
 
 go 1.26.1
 
